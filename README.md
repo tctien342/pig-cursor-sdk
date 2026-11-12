@@ -87,7 +87,7 @@ Environment: `CURSOR_SDK_BRIDGE_BIN` (bridge path), `PI_CURSOR_TURN_TIMEOUT`
 (default `5m`), `PI_CURSOR_TOOL_BATCH_GRACE_MS` (how long to keep reading after a
 host tool call to catch a batched turn, default `900`), `PI_CURSOR_GO_DEBUG=1`
 (debug logging to `~/.pig/agent/pig-cursor-sdk/agent.log`),
-`PI_CURSOR_SETTING_SOURCES`, `PI_CURSOR_FOOTER=0`.
+`PI_CURSOR_SETTING_SOURCES`, `PI_CURSOR_FOOTER=0`, `PI_CURSOR_SHOW_TOOLS=0`.
 
 ## Usage in the footer
 
@@ -190,8 +190,21 @@ An absent window means *Cursor has not told us*, never *you have headroom*.
 The host owns tools. This extension advertises pig's **own active tools and
 schemas** to Cursor, so when Cursor calls `bash`, pig executes `bash` and renders
 its own card, with its own hooks and permissions. Nothing about a tool call is
-ever written into the thinking channel, and Cursor's internal tool activity never
-appears in the transcript.
+ever written into the thinking channel.
+
+When Cursor uses one of **its own** tools instead — its built-in shell, reader,
+search — pig has no tool to run and no card to attach, so the extension draws the
+line itself:
+
+```text
+ ◇ cursor: shell · ls -1 · 2.6s
+ ◇ cursor: grep · deferPlanWork
+   command: grep -rn deferPlanWork .        # ctrl+o for the arguments
+```
+
+One line per call, written when the call ends, drawn from a custom session entry
+that is never model context — so the model is never shown another agent's tool
+traces, and a resumed session still redraws them.
 
 The run parks on an open bridge callback while pig runs the tool; the callback is
 resolved exactly once from the next request's `toolResult`, and the run continues
@@ -227,6 +240,7 @@ internal/planusage         plan allowance through Cursor Desktop's login: read-o
 proto/, gen/               sdk.v1 protos (vendored) and their generated Go
 docs/display-rules.md      the display contract, enforced by tests
 internal/provider/bar.go   the plan bar: fill, animation cap, width fitting
+internal/provider/cursortools.go  Cursor's own tool calls: one transcript line each
 docs/evidence/             audit, live event capture, terminal capture, bridge resume log
 dev/                       live/multi-turn/PTY/reload/plan runners, probes, benchmark — its own Go module
 scripts/gen-fallback-catalog.py  refresh the embedded offline catalog snapshot
@@ -251,6 +265,7 @@ dev/.venv/bin/python dev/tty-reload-check.py   # chat, /reload, and a turn after
 ./dev/bar-screen.sh               # the bar, read back from a terminal emulator's screen
 python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty-session.txt
 ./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
+dev/.venv/bin/python dev/tty-cursor-tools.py  # Cursor's own tools on screen: live, ctrl+o, and after resume
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
 cd dev && go run ./cmd/planprobe  # plan numbers + timings, without starting pig
 ```
@@ -274,10 +289,11 @@ the hang is in [docs/evidence/tty-reload.txt](docs/evidence/tty-reload.txt).
   Rolling 5-hour windows are not exposed by either surface — only the billing
   cycle is.
 - If Cursor answers with one of *its own* built-in tools instead of a host tool,
-  no card renders — there is no host tool to attach one to. The footer says
-  `Cursor ran Shell (its own tool)` instead; a transcript line for it would be
-  exactly the noise this extension exists to remove. Disable with
-  `PI_CURSOR_FOOTER=0`.
+  there is no host card to render, so the extension draws its own line —
+  `◇ cursor: shell · ls -1 · 2.6s`, with ctrl+o for the arguments. It is a custom
+  session entry, not model context, so it never reaches the transcript Cursor is
+  replayed. Cursor reports no result text for these calls, so the line says what
+  ran and how it ended, never what it printed. Disable with `PI_CURSOR_SHOW_TOOLS=0`.
 - Cost is reported as an estimate of zero with `totalFromProvider: false`: Cursor
   publishes token counts, not a per-run dollar amount.
 - Cursor's own account usage/quota is not exposed by `sdk.v1`, so there is no

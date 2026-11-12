@@ -67,6 +67,11 @@ func Extension() *sdk.Extension {
 	// `pig --list-models cursor` works without a bridge or the network.
 	e.RegisterProvider(providerID, st.providerConfig(st.startupModels()))
 
+	// Cursor's own tool calls (its built-in shell, reader, search) have no host
+	// tool behind them, so the extension draws their transcript line itself. One
+	// registration covers live turns and the replay of a resumed session.
+	e.EntryRenderer(provider.CursorToolEntryType, provider.RenderCursorToolEntry)
+
 	e.Command("cursor-refresh-models", "Refresh the live Cursor model catalog without restarting pig.", func(ctx sdk.Context, args string) error {
 		n, err := st.refreshModels(ctx)
 		if err != nil {

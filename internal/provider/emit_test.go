@@ -55,8 +55,6 @@ func TestEmitsOnlyTextThinkingAndHostToolCalls(t *testing.T) {
 	em := newTurnEmitter(modelMap(), entryFor())
 	// Only bash was advertised to Cursor, so "Shell" is Cursor's own tool.
 	em.hostToolSet = map[string]bool{"bash": true}
-	var notices []string
-	em.notice = func(verb, name string) { notices = append(notices, verb+" "+name) }
 	em.begin()
 	events := []cursor.RunEvent{
 		thinking("The user wants a shell command. "),
@@ -100,11 +98,10 @@ func TestEmitsOnlyTextThinkingAndHostToolCalls(t *testing.T) {
 		t.Fatalf("want one thinking and one text block, got %v", roles)
 	}
 
-	// Cursor's own tool activity must leave nothing behind, but must not be
-	// silently invisible either: the footer is told about it.
-	if len(notices) != 1 || notices[0] != "ran Shell" {
-		t.Fatalf("notices = %v, want exactly one \"ran Shell\" footer notice", notices)
-	}
+	// Cursor's own tool activity never becomes a provider event or message
+	// content: it is displayed as a session entry instead (see cursortools.go),
+	// and this test is the guarantee that the transcript path stays clean even if
+	// the tagging in the run stream ever misses one.
 	joined := em.text() + thinkingText(t, msg)
 	for _, banned := range []string{"$ echo hi", "call_cursor_shell", "Shell", "tool_call", "\"type\""} {
 		if strings.Contains(joined, banned) {

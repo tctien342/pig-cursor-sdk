@@ -18,12 +18,19 @@ const (
 	EventThinkingCompleted EventKind = "thinking_completed"
 	EventToolCallStarted   EventKind = "tool_call_started"
 	EventToolCallCompleted EventKind = "tool_call_completed"
-	EventStatus            EventKind = "status"
-	EventUsage             EventKind = "usage"
-	EventTask              EventKind = "task"
-	EventResult            EventKind = "result"
-	EventDone              EventKind = "done"
-	EventUnknown           EventKind = "unknown"
+	// EventCursorToolStarted / EventCursorToolCompleted are Cursor's own tools —
+	// ones this host never advertised, so pig cannot run or render them. They are
+	// tagged in the run stream rather than dropped, because Cursor really did
+	// something and the user is entitled to see it; the provider turns them into a
+	// transcript line of its own. They never become a host tool call.
+	EventCursorToolStarted   EventKind = "cursor_tool_started"
+	EventCursorToolCompleted EventKind = "cursor_tool_completed"
+	EventStatus              EventKind = "status"
+	EventUsage               EventKind = "usage"
+	EventTask                EventKind = "task"
+	EventResult              EventKind = "result"
+	EventDone                EventKind = "done"
+	EventUnknown             EventKind = "unknown"
 )
 
 // Event is one normalized item of a Cursor run stream.

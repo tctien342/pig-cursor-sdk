@@ -1,10 +1,12 @@
 # Display rules
 
-One contract: **the transcript contains assistant text, assistant thinking, and
-tool calls pig itself can run. Nothing else.**
+One contract: **what the model owns is text, thinking, and tool calls pig itself
+can run. What Cursor did on its own is an annotation the extension draws. Nothing
+else, and nothing of Cursor's protocol in either.**
 
 `internal/provider/emit.go` is the single object that turns Cursor run events
 into pig provider events, so the rules are one place, testable without a bridge.
+`internal/provider/cursortools.go` owns the one exception below.
 
 ## The rules
 
@@ -15,10 +17,12 @@ into pig provider events, so the rules are one place, testable without a bridge.
    own hooks, permissions, and result rendering. The `id` is Cursor's call id,
    which is what the resumed run matches its tool result against.
 3. **The tool channel is never faked.** Cursor's shell/read/write activity, step
-   frames, lifecycle chatter, and protocol payloads never enter text or thinking.
-   If a call is not a host tool there is no card the host could attach to, so it
-   produces no transcript content — and it is not silently invisible either: the
-   footer status line says `Cursor ran Shell (its own tool)`, once per tool.
+   frames, lifecycle chatter, and protocol payloads never enter text or thinking,
+   and never become a `toolCall` block: there is no host tool behind them, so a
+   card would promise a tool call pig cannot run. What Cursor ran instead is one
+   annotation line per call — see *Cursor's own tool calls* below. While a call is
+   still running the footer says `Cursor running shell · ls -1`, and it clears when
+   the line replaces it.
 4. **One card per call, resolved exactly once.** The bridge callback is the
    authoritative record of a host tool call; the stream's own `tool_call` frame
    for the same id is bookkeeping only. A duplicate callback for the same id is
@@ -43,7 +47,7 @@ into pig provider events, so the rules are one place, testable without a bridge.
 
 | rule | test |
 | --- | --- |
-| 1, 3 | `TestEmitsOnlyTextThinkingAndHostToolCalls` (also asserts the one footer notice for Cursor's own tool) |
+| 1, 3 | `TestEmitsOnlyTextThinkingAndHostToolCalls` — a Cursor-side call produces no provider event at all, even if the run stream ever fails to tag one |
 | 2 | `TestHostToolCardCarriesRealNameAndArgs` |
 | 5 | `TestStreamedTextIsNeverDuplicated` |
 | 6 | `TestResumedTurnStillDeliversTheFinalAnswer` |
@@ -52,6 +56,64 @@ into pig provider events, so the rules are one place, testable without a bridge.
 
 Exactly-once and duplicate-callback behaviour (rule 4) is covered in
 `internal/cursor/run_test.go`.
+
+## Cursor's own tool calls
+
+A Cursor agent has built-in tools that were never advertised to it — its own
+shell, reader, search. pig cannot run them and has no card to attach to, so for a
+long time this extension printed nothing, which read as the agent stalling.
+Silence was the wrong answer: what Cursor ran is a fact about the turn.
+
+It is shown as **one custom session entry per call**, rendered by the extension
+(`e.EntryRenderer(provider.CursorToolEntryType, …)`):
+
+```text
+ ◇ cursor: shell · ls -1 · 2.6s          finished; the duration says it ran
+ ◇ cursor: shell · cargo test · failed   Cursor reported an error
+ ◇ cursor: read · src/x.go · no result   the turn ended while it was running
+ ◇ cursor: grep · deferPlanWork          no duration: it was under 0.1s
+```
+
+with ctrl+o expanding the arguments it ran with:
+
+```text
+ ◇ cursor: shell · ls -1 · 2.6s
+   command: ls -1
+   timeout: 30000
+```
+
+Why an entry and not a provider event or a message:
+
+- a custom entry is **not model context** (session-format: "It does not become
+  model context"), so neither pig's next turn nor the transcript this extension
+  replays to Cursor ever contains it. Injecting tool traces into the assistant
+  message is exactly what put 60% of the thinking characters in the old extension.
+- it persists, so a resumed session redraws the same line from stored data — with
+  no live run, and with whatever theme the user has now.
+- the summary is chosen per kind of call (command for a shell, pattern for a
+  grep, path for a read/edit), because a grep line without its pattern is noise.
+- one line, never two: the live stream reports the same call twice through two
+  envelopes, so calls are keyed by Cursor's id, and unfinished calls are written
+  at turn end as `no result` rather than vanishing.
+
+Nothing of Cursor's tool *output* is stored or shown: measured on a real account,
+a built-in call reports no result text at all, and a second agent's tool dump in
+the transcript is what this document exists to forbid.
+
+`PI_CURSOR_SHOW_TOOLS=0` turns the lines off; the footer hint stays, so the tool
+activity is never silently invisible.
+
+| rule | test |
+| --- | --- |
+| one line per call, unfinished calls say so | `TestTrackerWritesOneEntryPerCall`, `TestCursorToolLineNeverClaimsWhatDidNotHappen` |
+| what the summary says | `TestCursorToolSummaryNamesWhatTheCallDid` |
+| one line, never wrapped, outcome survives a narrow terminal | `TestCursorToolLineStaysOneLineAndKeepsItsOutcome` |
+| expanded view adds the arguments | `TestCursorToolExpandedAddsArguments` |
+| a rejected entry must not fail the turn | `TestTrackerSurvivesARejectedEntry` |
+
+Live proof: `dev/tty-cursor-tools.py` — runs a turn with no host tools advertised
+(so Cursor can only use its own), asserts the line is on the real screen, that
+ctrl+o expands it, and that reopening the session draws it again from the entry.
 
 ## A batch of tool calls is one turn
 

@@ -18,10 +18,6 @@ import (
 type turnEmitter struct {
 	p    *partial
 	sink func(map[string]any)
-	// notice reports Cursor-side tool activity: it must never become transcript
-	// content, but "the agent did something I cannot see" deserves a hint, so it
-	// goes to the footer status area instead.
-	notice func(verb, toolName string)
 
 	tools       []map[string]any
 	pending     []pendingRef
@@ -89,12 +85,10 @@ func (t *turnEmitter) add(ev cursor.RunEvent) (stop bool) {
 		t.p.appendText(ev.Text)
 		t.push(map[string]any{"type": "text_delta", "contentIndex": idx, "delta": ev.Text})
 	case cursor.EventToolCallStarted:
+		// A Cursor-side call normally reaches this emitter already tagged (see
+		// cursor.EventCursorToolStarted) and is displayed as a session entry. This
+		// check is the backstop: an untagged one must still never become a host card.
 		if ev.ToolCall != nil && !t.isHostTool(ev.ToolCall.ToolName) {
-			// Cursor executed one of its own tools. No host card exists for it, so
-			// the transcript stays clean and the footer says so.
-			if t.notice != nil {
-				t.notice("ran", ev.ToolCall.ToolName)
-			}
 			return false
 		}
 		return t.hostToolCall(ev)

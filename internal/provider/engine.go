@@ -739,17 +739,16 @@ type turnOutcome struct{ retry bool }
 func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) turnOutcome {
 	em := newTurnEmitter(model, entry)
 	em.sink = func(ev map[string]any) { stream.Push(ev) }
-	// Cursor's own tool activity is invisible by design; a footer hint is the
-	// honest middle ground between silence and transcript noise.
-	seen := map[string]bool{}
-	em.notice = func(verb, toolName string) {
-		if seen[toolName] {
-			return
-		}
-		seen[toolName] = true
-		ctx.SetStatus("cursor-activity", "Cursor "+verb+" "+toolName+" (its own tool)")
-	}
 	em.hostToolSet = toolNameSet(tools)
+
+	// Cursor-side tool calls: one transcript line each, written when the call
+	// finishes, plus a live footer line while one is running. See cursortools.go
+	// for why this is a session entry and never a provider event.
+	ct := newCursorToolTracker(ctx, e.cfg.Logger)
+	if cursorToolsDisabled() || !ctx.HasUI() {
+		ct = nil
+	}
+
 	em.begin()
 
 	turnCtx, cancelTurn := context.WithTimeout(goCtx(ctx), e.turnDeadline())
@@ -778,6 +777,15 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 		if msg, failed := em.statusFailure(ev); failed {
 			e.failWith(stream, em.p, model, errors.New(msg))
 			return turnOutcome{}
+		}
+		if ct != nil && (ev.Kind == cursor.EventCursorToolStarted || ev.Kind == cursor.EventCursorToolCompleted) {
+			ct.note(ev)
+			if ev.Kind == cursor.EventCursorToolStarted && ev.ToolCall != nil {
+				ctx.SetStatus("cursor-activity", cursorToolHint(ev.ToolCall.ToolName, cursorToolSummary(ev.ToolCall.ToolName, ev.ToolCall.Args)))
+			} else {
+				// The line in the transcript says it better than the footer can.
+				ctx.ClearStatus("cursor-activity")
+			}
 		}
 		if em.add(ev) {
 			hosted = true
@@ -825,6 +833,10 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	reason := "stop"
 	if terminal != nil && terminal.Status == "CANCELLED" {
 		reason = "aborted"
+	}
+	if ct != nil {
+		ct.finish()
+		ctx.ClearStatus("cursor-activity")
 	}
 	reason = em.finish(reason, terminal)
 	sess.lastUsage = em.p.usage

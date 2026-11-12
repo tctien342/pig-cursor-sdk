@@ -480,10 +480,36 @@ func (r *Run) suppressed(kind EventKind) bool {
 		return false
 	}
 	switch kind {
-	case EventTextDelta, EventThinkingDelta, EventThinkingCompleted:
+	case EventTextDelta, EventThinkingDelta, EventThinkingCompleted,
+		EventCursorToolStarted, EventCursorToolCompleted:
+		// A Cursor-tool line already shown before the park is part of the segment
+		// the replay repeats; showing it twice is the noise this extension exists
+		// to remove.
 		return true
 	}
 	return false
+}
+
+// logCursorTool records what Cursor ran on its own. The names and arguments are
+// what the transcript line is built from, and the set of names Cursor actually
+// uses is not a published contract, so the log is how a surprise gets noticed.
+func (r *Run) logCursorTool(ev Event) {
+	if ev.ToolCall == nil || r.agent == nil || r.agent.client == nil {
+		return
+	}
+	r.agent.client.log.Debug("cursor internal tool",
+		"kind", string(ev.Kind), "tool", ev.ToolCall.ToolName,
+		"status", ev.ToolCall.Status, "args", fmt.Sprint(ev.ToolCall.Args),
+		"resultBytes", len(ev.ToolCall.Text), "isError", ev.ToolCall.IsError)
+}
+
+// overflow is the one failure the drain loop cannot recover from: the provider
+// stopped consuming, so the run cannot keep buffering.
+func (r *Run) overflow() {
+	r.mu.Lock()
+	r.drainErr = errors.New("cursor: run produced more events than the host can consume")
+	r.mu.Unlock()
+	r.abandon(errors.New("cursor: event queue overflow"))
 }
 
 // Resume continues watching a run whose live Send stream was closed while it
@@ -801,7 +827,14 @@ func (r *Run) drain(stream *connect.ServerStreamForClient[sdkpb.RunStreamMessage
 				id := ev.ToolCall.ID
 				if !r.agent.IsHostTool(ev.ToolCall.ToolName) {
 					// Cursor executed one of its own tools. It is not a host tool
-					// card and must not be replayed as one.
+					// card and must not be replayed as one, but it is not nothing
+					// either: tag it so the provider can show what Cursor did.
+					ev.Kind = EventCursorToolStarted
+					r.logCursorTool(ev)
+					if !r.queue.push(RunEvent{Event: ev}) {
+						r.overflow()
+						return
+					}
 					continue
 				}
 				if r.emittedCall(id) {
@@ -815,6 +848,17 @@ func (r *Run) drain(stream *connect.ServerStreamForClient[sdkpb.RunStreamMessage
 				r.markEmitted(id)
 				continue
 			}
+			if ev.Kind == EventToolCallCompleted && ev.ToolCall != nil && !r.agent.IsHostTool(ev.ToolCall.ToolName) {
+				// The other half of Cursor's own tool call: the status, the duration
+				// and the result text, which is what makes the line honest.
+				ev.Kind = EventCursorToolCompleted
+				r.logCursorTool(ev)
+				if !r.queue.push(RunEvent{Event: ev}) {
+					r.overflow()
+					return
+				}
+				continue
+			}
 			if ev.Kind == EventToolCallCompleted && ev.ToolCall != nil && r.emittedCall(ev.ToolCall.ID) {
 				r.openBarrierOnCompletion(ev.ToolCall.Status)
 				continue
@@ -823,10 +867,7 @@ func (r *Run) drain(stream *connect.ServerStreamForClient[sdkpb.RunStreamMessage
 				continue
 			}
 			if !r.queue.push(RunEvent{Event: ev}) {
-				r.mu.Lock()
-				r.drainErr = errors.New("cursor: run produced more events than the host can consume")
-				r.mu.Unlock()
-				r.abandon(errors.New("cursor: event queue overflow"))
+				r.overflow()
 				return
 			}
 		}
