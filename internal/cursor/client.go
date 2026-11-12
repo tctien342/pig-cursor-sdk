@@ -214,7 +214,7 @@ type UsageReport struct {
 // eventually consistent after a run ends, so an empty CostLabel means "not
 // reported yet", not free.
 func (c *Client) Usage(ctx context.Context, agentID string) (*UsageReport, error) {
-	res, err := c.Agent.GetUsage(ctx, connect.NewRequest(&sdkpb.GetUsageRequest{AgentId: agentID}))
+	res, err := c.Agent.GetUsage(ctx, connect.NewRequest(&sdkpb.GetUsageRequest{AgentId: UsageAgentID(agentID)}))
 	if err != nil {
 		return nil, err
 	}
@@ -235,6 +235,119 @@ func (c *Client) Usage(ctx context.Context, agentID string) (*UsageReport, error
 		}
 	}
 	return out, nil
+}
+
+// UsageAgentID normalises an agent id for the usage API. Cursor creates local
+// agents with ids that its own CreateAgent response and ResumeAgent accept bare
+// ("98181694-…"), while GetUsage only accepts the qualified form it lists agents
+// by ("agent-98181694-…"). Ids that already carry a prefix pass through, so this
+// is safe for ids taken from ListAgents.
+func UsageAgentID(id string) string {
+	switch {
+	case id == "", strings.HasPrefix(id, "agent-"), strings.HasPrefix(id, "bc-"):
+		return id
+	default:
+		return "agent-" + id
+	}
+}
+
+// AgentBrief is one entry from Cursor's agent list, in plain Go types.
+type AgentBrief struct {
+	ID        string
+	Name      string
+	CreatedAt time.Time
+	Archived  bool
+}
+
+// ListAgents asks Cursor for the agents this account has, newest first. It is the
+// only official way to widen usage beyond the agents this process created.
+func (c *Client) ListAgents(ctx context.Context, apiKey string, limit uint32) ([]AgentBrief, error) {
+	res, err := c.Agent.ListAgents(ctx, connect.NewRequest(&sdkpb.ListAgentsRequest{
+		Options: &sdkpb.ListAgentsOptions{Limit: limit, ApiKey: apiKey},
+	}))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AgentBrief, 0, len(res.Msg.GetItems()))
+	for _, it := range res.Msg.GetItems() {
+		b := AgentBrief{ID: it.GetAgentId(), Name: it.GetName(), Archived: it.GetArchived()}
+		if ts := it.GetCreatedAt(); ts != nil {
+			b.CreatedAt = ts.AsTime()
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// AccountUsageReport is Cursor's own usage numbers summed across the agents it
+// lists. Sampled and Truncated say when the cap stopped us short of the full list,
+// so the footer can tell a partial total from a complete one.
+type AccountUsageReport struct {
+	Agents       int // agents listed
+	Sampled      int // agents whose usage Cursor answered
+	Failed       int
+	TotalTokens  int64
+	InputTokens  int64
+	OutputTokens int64
+	Reasoning    int64
+	CostCents    float64
+	CostLabel    string // "charged" | "raw" | ""
+	Runs         int
+	Truncated    bool
+}
+
+// AccountUsage lists up to limit agents and asks Cursor for each one's usage,
+// with bounded concurrency. Cost stays "eventually consistent" per Cursor, so a
+// run that just ended may not be in the total yet.
+func (c *Client) AccountUsage(ctx context.Context, apiKey string, limit uint32) (*AccountUsageReport, error) {
+	agents, err := c.ListAgents(ctx, apiKey, limit)
+	if err != nil {
+		return nil, err
+	}
+	rep := &AccountUsageReport{Agents: len(agents), Truncated: len(agents) >= int(limit)}
+
+	const workers = 8
+	sem := make(chan struct{}, workers)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, a := range agents {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			u, err := c.Usage(ctx, id)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil || u == nil:
+				rep.Failed++
+			default:
+				rep.Sampled++
+				rep.TotalTokens += int64(orInt64(u.Tokens.TotalTokens, u.Tokens.InputTokens+u.Tokens.OutputTokens))
+				rep.InputTokens += u.Tokens.InputTokens
+				rep.OutputTokens += u.Tokens.OutputTokens
+				rep.Reasoning += u.Tokens.ReasoningTokens
+				rep.CostCents += u.CostCents
+				rep.Runs += u.Runs
+				if rep.CostLabel == "" {
+					rep.CostLabel = u.CostLabel
+				}
+			}
+		}(a.ID)
+	}
+	wg.Wait()
+	return rep, nil
+}
+
+func orInt64(v int64, fallback int64) int64 {
+	if v != 0 {
+		return v
+	}
+	return fallback
 }
 
 // Tools returns the callback registration surface.

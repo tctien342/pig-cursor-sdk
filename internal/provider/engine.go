@@ -17,6 +17,7 @@ import (
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 
 	cursor "github.com/tctien342/pig-cursor-sdk/internal/cursor"
+	planusage "github.com/tctien342/pig-cursor-sdk/internal/planusage"
 )
 
 // Config is the engine's environment, resolved once from the host.
@@ -44,6 +45,18 @@ type Engine struct {
 	startErr string
 	override ModelOverride
 	agents   *agentRegistry
+
+	// plan is Cursor's plan-usage picture, read through Cursor Desktop's login
+	// when that exists. Nil until it has been read successfully once.
+	plan     *planusage.Snapshot
+	planKind planusage.Availability
+	planMsg  string
+	planAt   time.Time
+
+	// account is Cursor's usage summed across the agents it lists for this key,
+	// refreshed lazily so the footer does not pay for the fan-out every turn.
+	account   AccountTotals
+	accountAt time.Time
 
 	// lastRate is the most recent usage window Cursor reported when refusing a
 	// call. sdk.v1 has no proactive limit RPC, so this is opportunistic: it is
@@ -133,6 +146,156 @@ type UsageTotals struct {
 	Reported     bool
 }
 
+// planTTL bounds how often the plan readout may contact Cursor's own API.
+func planTTL() time.Duration {
+	if v := os.Getenv("PI_CURSOR_PLAN_TTL_S"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return 5 * time.Minute
+}
+
+// planEnabled reports whether the plan readout is switched on. It is on by
+// default and turns itself off when Cursor Desktop is absent or logged out, so a
+// machine without Cursor simply never shows a plan line.
+func planEnabled() bool { return os.Getenv("PI_CURSOR_PLAN_USAGE") != "0" }
+
+// RefreshPlan re-reads Cursor's plan usage when the cached copy is stale, and
+// never blocks longer than one short HTTP round trip. Call it from turn_end or a
+// command — never mid-stream. It checks locally first, so a machine without
+// Cursor Desktop costs one stat and no network.
+func (e *Engine) RefreshPlan(force bool) (*planusage.Snapshot, planusage.Availability, string) {
+	e.mu.Lock()
+	snap, kind, msg, fresh := e.plan, e.planKind, e.planMsg, time.Since(e.planAt) < planTTL()
+	e.mu.Unlock()
+	if !planEnabled() {
+		return nil, "disabled", "PI_CURSOR_PLAN_USAGE=0"
+	}
+	// A recent "not installed" or "not logged in" answer is cached too, so a
+	// machine without Cursor Desktop is asked about once per TTL, not every turn.
+	if !force && fresh {
+		if snap != nil {
+			return snap, planusage.Available, ""
+		}
+		if kind != "" {
+			return nil, kind, msg
+		}
+	}
+
+	avail, why := planusage.Check()
+	if avail != planusage.Available {
+		e.mu.Lock()
+		e.planKind, e.planMsg = avail, why
+		e.mu.Unlock()
+		return nil, avail, why
+	}
+	token, err := planusage.Token()
+	if err != nil {
+		e.mu.Lock()
+		e.planKind, e.planMsg = planusage.Unreadable, err.Error()
+		e.mu.Unlock()
+		return nil, planusage.Unreadable, err.Error()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	got, err := planusage.Fetch(ctx, token)
+	if err != nil {
+		e.cfg.Logger.Debug("cursor plan usage unavailable", "err", err)
+		e.mu.Lock()
+		e.planKind, e.planMsg = "unavailable", err.Error()
+		e.mu.Unlock()
+		return nil, "unavailable", err.Error()
+	}
+	e.mu.Lock()
+	e.plan, e.planKind, e.planMsg, e.planAt = got, planusage.Available, "", time.Now()
+	e.mu.Unlock()
+	return got, planusage.Available, ""
+}
+
+// Plan returns the last successful plan snapshot plus the current availability.
+func (e *Engine) Plan() (*planusage.Snapshot, planusage.Availability, string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.plan, e.planKind, e.planMsg
+}
+
+// AccountTotals is Cursor's own usage numbers summed across every agent it lists
+// for this API key. This is the widest official view available: sdk.v1 has no
+// account-wide usage or plan-limit RPC, so "account" here means "the agents
+// Cursor will list for this key", and Sampled/Failed say how complete it is.
+type AccountTotals struct {
+	Agents       int
+	Sampled      int
+	Failed       int
+	TotalTokens  int64
+	InputTokens  int64
+	OutputTokens int64
+	Reasoning    int64
+	CostCents    float64
+	CostLabel    string
+	Runs         int
+	Truncated    bool
+	Known        bool
+	Err          string
+}
+
+// accountTTL bounds how often the footer refresh may fan out over agents.
+func accountTTL() time.Duration {
+	if v := os.Getenv("PI_CURSOR_ACCOUNT_TTL_S"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return 3 * time.Minute
+}
+
+// RefreshAccount re-reads account-wide usage when the cached copy has gone stale
+// (or force is set), and returns the current picture. It runs on the caller's
+// clock: call it from turn_end or a command, never mid-stream.
+func (e *Engine) RefreshAccount(apiKey string, limit uint32, force bool) AccountTotals {
+	e.mu.Lock()
+	cached, fresh := e.account, time.Since(e.accountAt) < accountTTL()
+	client := e.client
+	e.mu.Unlock()
+	if !force && fresh && cached.Known {
+		return cached
+	}
+	if client == nil || apiKey == "" {
+		return cached
+	}
+
+	// Not goCtx(ctx): a fan-out over dozens of agents is slower than one event
+	// handler's life, and a canceled mid-flight read would leave the footer stuck
+	// on whatever it had. Bounded, and independent of the caller's clock.
+	rctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	rep, err := client.AccountUsage(rctx, apiKey, limit)
+	if err != nil {
+		cached.Err = err.Error()
+		e.cfg.Logger.Debug("account usage refresh failed", "err", err)
+		return cached
+	}
+	out := AccountTotals{
+		Agents: rep.Agents, Sampled: rep.Sampled, Failed: rep.Failed,
+		TotalTokens: rep.TotalTokens, InputTokens: rep.InputTokens, OutputTokens: rep.OutputTokens,
+		Reasoning: rep.Reasoning, CostCents: rep.CostCents, CostLabel: rep.CostLabel,
+		Runs: rep.Runs, Truncated: rep.Truncated, Known: true,
+	}
+	e.mu.Lock()
+	e.account, e.accountAt = out, time.Now()
+	e.mu.Unlock()
+	return out
+}
+
+// Account returns the cached account-wide picture without contacting Cursor.
+func (e *Engine) Account() AccountTotals {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.account
+}
+
 // clientNow returns the live bridge client, or nil when none has been spawned.
 func (e *Engine) clientNow() *cursor.Client {
 	e.mu.Lock()
@@ -167,7 +330,7 @@ func (e *Engine) Reported() UsageTotals {
 // reportUsage records what the turn cost. Cursor's per-agent totals are the
 // authority (they cover every run in the agent); the run's own usage frame is the
 // fallback when that RPC is unavailable, and it has no cost.
-func (e *Engine) reportUsage(ctx sdk.Context, sess *Session, terminal *cursor.RunResult) {
+func (e *Engine) reportUsage(sess *Session, terminal *cursor.RunResult) {
 	var snapshot UsageTotals
 	if u := usageOf(terminal); u != nil {
 		snapshot = UsageTotals{
@@ -178,7 +341,11 @@ func (e *Engine) reportUsage(ctx sdk.Context, sess *Session, terminal *cursor.Ru
 
 	client := e.clientNow()
 	if client != nil && sess.AgentID != "" {
-		uctx, cancel := context.WithTimeout(goCtx(ctx), 3*time.Second)
+		// Deliberately not goCtx(ctx): the provider request is already finished at
+		// this point, and its context is canceled — a usage call made on it fails
+		// instantly with "context canceled" and the footer never fills in. The
+		// agent outlives the request, so the call gets its own short deadline.
+		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		rep, err := client.Usage(uctx, sess.AgentID)
 		if err == nil && rep != nil {
@@ -667,7 +834,7 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	stream.End(em.p.msg)
 	// Cost accounting runs after the host has its answer: a slow or unsupported
 	// usage RPC must never delay or break a turn.
-	e.reportUsage(ctx, sess, terminal)
+	e.reportUsage(sess, terminal)
 	if debug {
 		e.cfg.Logger.Debug("turn complete", "reason", reason, "events", len(em.events()), "tools", len(em.tools),
 			"tokens", sess.usage.TotalTokens, "cents", sess.usage.CostCents)

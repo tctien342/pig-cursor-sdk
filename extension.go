@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	planusage "github.com/tctien342/pig-cursor-sdk/internal/planusage"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,13 +124,22 @@ func Extension() *sdk.Extension {
 		if l := usageLine(st.engineRef()); l != "" {
 			lines = append(lines, l)
 		}
+		if eng := st.engineRef(); eng != nil {
+			lines = append(lines, planDetail(eng, false)[0])
+		}
 		ctx.Notify(strings.Join(lines, "\n"), "info")
 		return nil
 	})
 
 	// Usage is server-side and only settles after a run ends, so the footer is
 	// refreshed when a turn finishes rather than polled.
+	// Plan usage rides on Cursor Desktop's login, so it is read only when that
+	// exists; Check() is a stat plus one indexed key, and the answer is cached.
 	e.OnEvent("turn_end", func(ctx sdk.Context, _ map[string]any) (any, error) {
+		st.refreshPlan(false)
+		// Account totals cost a fan-out over agents, so refresh at most every
+		// PI_CURSOR_ACCOUNT_TTL_S (3 min default) and skip the wait otherwise.
+		st.refreshAccount(ctx, false)
 		st.refreshStatus(ctx)
 		return nil, nil
 	})
@@ -139,12 +150,32 @@ func Extension() *sdk.Extension {
 			ctx.Notify("cursor: no active session yet (start a turn, then ask again)", "info")
 			return nil
 		}
+		var out []string
+		if a := st.refreshAccount(ctx, true); a.Known {
+			line := fmt.Sprintf("account: %s tokens across %d of %d agents (%d runs)",
+				formatTokens(a.TotalTokens), a.Sampled, a.Agents, a.Runs)
+			if c := formatCost(a.CostCents, a.CostLabel); c != "" {
+				line += " · " + c + " (" + a.CostLabel + ")"
+			}
+			if a.Truncated {
+				line += " · list capped; widen with PI_CURSOR_ACCOUNT_LIMIT"
+			}
+			if a.Failed > 0 {
+				line += fmt.Sprintf(" · %d agent(s) reported no usage", a.Failed)
+			}
+			out = append(out, line)
+		} else if a.Err != "" {
+			out = append(out, "account: could not read ("+a.Err+")")
+		}
 		u := eng.Reported()
 		if !u.Reported {
-			ctx.Notify("cursor: no usage reported yet — finish a turn first", "info")
+			out = append(out, "this session: nothing yet — finish a turn first")
+			out = append(out, planDetail(eng, true)...)
+			out = append(out, "window: "+windowNote(eng))
+			ctx.Notify(strings.Join(out, "\n"), "info")
 			return nil
 		}
-		lines := []string{fmt.Sprintf("tokens: %s total (%s in · %s out",
+		lines := []string{fmt.Sprintf("this session: %s tokens (%s in · %s out",
 			formatTokens(u.TotalTokens), formatTokens(u.InputTokens), formatTokens(u.OutputTokens))}
 		if u.Reasoning > 0 {
 			lines[0] += fmt.Sprintf(" · %s reasoning", formatTokens(u.Reasoning))
@@ -156,13 +187,11 @@ func Extension() *sdk.Extension {
 		} else {
 			lines = append(lines, "cost: not reported by Cursor for this account")
 		}
-		if w := limitWindow(eng); w != "" {
-			lines = append(lines, "window: "+w+" (reported by Cursor when it refused a call)")
-		} else {
-			lines = append(lines, "window: Cursor reports no usage-limit RPC, so nothing is known until it refuses a call")
-		}
-		lines = append(lines, "scope: the Cursor agents this pig session created — Cursor exposes no account-wide usage API")
-		ctx.Notify(strings.Join(lines, "\n"), "info")
+
+		out = append(out, lines...)
+		out = append(out, "window: "+windowNote(eng))
+		out = append(out, "scope: agents listed for this API key — Cursor exposes no account-wide usage or plan-limit endpoint to a key")
+		ctx.Notify(strings.Join(out, "\n"), "info")
 		return nil
 	})
 
@@ -585,6 +614,89 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// refreshPlan re-reads Cursor's plan usage when the cached answer is stale, and
+// returns the snapshot when there is one.
+func (s *state) refreshPlan(force bool) *planusage.Snapshot {
+	eng := s.engineRef()
+	if eng == nil {
+		return nil
+	}
+	snap, _, _ := eng.RefreshPlan(force)
+	return snap
+}
+
+// enginePlan returns the last good plan snapshot without contacting Cursor.
+func enginePlan(eng *provider.Engine) *planusage.Snapshot {
+	if eng == nil {
+		return nil
+	}
+	snap, _, _ := eng.Plan()
+	return snap
+}
+
+// planDetail is the /cursor-usage block: the numbers when they are known, and the
+// reason they are not when they are not.
+func planDetail(eng *provider.Engine, force bool) []string {
+	snap, kind, msg := eng.RefreshPlan(force)
+	if snap == nil {
+		switch kind {
+		case planusage.NoInstall:
+			return []string{"plan: not read — Cursor Desktop is not installed on this machine"}
+		case planusage.NoLogin:
+			return []string{"plan: not read — Cursor Desktop is installed but logged out (sign in inside the Cursor app)"}
+		default:
+			return []string{"plan: not read — " + orNone(msg)}
+		}
+	}
+	line := fmt.Sprintf("plan: %s%s · used $%s of $%s included",
+		orNone(snap.PlanName), planPrice(snap),
+		money(float64(snap.IncludedSpend)/100), money(float64(snap.IncludedLimit)/100))
+	if snap.BonusSpend > 0 {
+		line += fmt.Sprintf(" + $%s bonus ($%s total)",
+			money(float64(snap.BonusSpend)/100), money(float64(snap.TotalSpend)/100))
+	}
+	out := []string{line, fmt.Sprintf("cycle: %s → %s · %.1f%% used",
+		snap.CycleStart.Local().Format("2 Jan"), snap.CycleEnd.Local().Format("2 Jan"), snap.PercentUsed)}
+	if snap.PercentUsed > 0 {
+		out[1] += fmt.Sprintf(" · %.2f%% (Cursor's own figure)", snap.PercentUsed)
+	}
+	if snap.Account != "" {
+		out = append(out, "account: "+snap.Account+" (via Cursor Desktop login)")
+	}
+	return out
+}
+
+func planPrice(snap *planusage.Snapshot) string {
+	if snap.Price == "" {
+		return ""
+	}
+	return " (" + snap.Price + ")"
+}
+
+// refreshAccount re-reads account-wide usage and remembers the engine so the
+// footer can show it. Cheap when the cached copy is still fresh.
+func (s *state) refreshAccount(ctx sdk.Context, force bool) provider.AccountTotals {
+	eng := s.engineRef()
+	if eng == nil {
+		return provider.AccountTotals{}
+	}
+	limit := uint32(50)
+	if v := os.Getenv("PI_CURSOR_ACCOUNT_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+			limit = uint32(n)
+		}
+	}
+	return eng.RefreshAccount(s.apiKey(ctx), limit, force)
+}
+
+// windowNote says, in words, what is and is not known about plan limits.
+func windowNote(eng *provider.Engine) string {
+	if w := limitWindow(eng); w != "" {
+		return w + " — reported by Cursor when it refused a call"
+	}
+	return "no plan-limit data: Cursor gives limit windows only inside a refusal error, and none to an API key proactively"
 }
 
 // limitWindow renders Cursor's reported usage window, if any. The bridge protocol

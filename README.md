@@ -96,7 +96,7 @@ The status line carries what the account has spent, refreshed when a turn ends
 answer):
 
 ```text
-cursor · grok-4.7 · 24.1k tok · $0.31 · pid 41821
+cursor · grok-4.7 · plan 7% · included used · 24.1k tok · pid 41821
 ```
 
 Numbers come from Cursor's own `GetUsage` for the agents this extension created:
@@ -105,37 +105,76 @@ amount and as `… raw` when it only reports undiscounted model cost (plan-inclu
 BYOK, and grant accounts report no charged figure, so the label matters).
 `/cursor-usage` gives the in/out/reasoning split and the run count.
 
-### Limits ("how much of my plan is left")
+### Plan usage: "how much of my allowance is left"
 
-The bridge protocol has **no** usage-limit RPC. The only limit data in `sdk.v1`
-rides on a refusal: `SdkErrorDetails.rate_limit` carries `limit`, `remaining`, and
-`reset_epoch_seconds`. So this extension records that window the moment Cursor
-reports one and keeps showing it until the window resets — in the footer
+This one needs Cursor Desktop, and it is worth being exact about why.
+
+An API key cannot ask about limits. Measured on a real account:
+
+| source | result |
+| --- | --- |
+| `GetUsage` for a local agent | `not_found: Unknown agent: agent-c8c7d38a-…` — the call is cloud-only |
+| `ListAgents` for the key | 0 agents, because local agents live in the bridge store, not the cloud |
+| `aiserver.v1.DashboardService/GetCurrentPeriodUsage` with the API key | `401 ERROR_NOT_LOGGED_IN` under every key-auth form |
+| same call with Cursor Desktop\'s login token | `200` |
+
+So when Cursor Desktop is installed **and logged in on this machine**, the
+extension reads the plan through that login and the footer gains a real
+allowance line:
 
 ```text
-cursor · grok-4.7 · limit 0 of 500 left · resets in 2h05m (21:05)
+cursor · grok-4.7 · plan 7% · included used · $55.13 bonus · 24.1k tok
 ```
 
-and inside the failure itself, so a rejected turn reads
+`/cursor-usage` prints the whole picture:
+
+```text
+plan: Team ($40/mo) · used $20.00 of $20.00 included + $55.13 bonus ($75.13 total)
+cycle: 30 Oct → 30 Nov · 7.08% used (Cursor's own figure)
+account: you@example.com (via Cursor Desktop login)
+```
+
+**It turns itself on and off.** On `turn_end` the extension checks locally — one
+`stat` plus one indexed key read, measured at 3 ms — and only contacts Cursor if
+Cursor Desktop is there with a token. No Cursor install, or a logged-out one, and
+no plan line ever appears; `/cursor-usage` then says which case it is:
+
+```text
+plan: not read — Cursor Desktop is not installed on this machine
+plan: not read — Cursor Desktop is installed but logged out (sign in inside the Cursor app)
+```
+
+Never a zero. An unknown is shown as an unknown, because "no data" and "you are
+out of usage" must not look the same.
+
+What it touches, plainly: one read-only SQLite query for
+`cursorAuth/accessToken` inside Cursor\'s own `state.vscdb` (opened `mode=ro`,
+`query_only`, 2 s busy timeout, so a running Cursor is unaffected), the token held
+in memory only, never written to a log, the transcript, or any file. The limit
+figures come from Cursor\'s app API — not a published contract, so fields can move;
+a parse or HTTP failure means no line, not a wrong one.
+
+| env | effect |
+| --- | --- |
+| `PI_CURSOR_PLAN_USAGE=0` | never read the plan, even with Cursor present |
+| `PI_CURSOR_PLAN_TTL_S` | re-read interval, default `300` |
+| `PI_CURSOR_STORE_PATH` | use a different Cursor store (tests, non-standard install) |
+
+Cost: the two HTTP calls took 1.8 s end to end, off the request path — a turn is
+never waiting on them. `go run ./cmd/planprobe` prints the numbers and the timings
+without starting pig.
+
+### Limits from the protocol itself
+
+`sdk.v1` carries limit data only inside a refusal: `SdkErrorDetails.rate_limit`
+(`limit`, `remaining`, `reset_epoch_seconds`). That is captured the moment Cursor
+reports one and kept until the window resets, footer and error text both:
 
 ```text
 cursor run stream: usage limit exceeded — Cursor usage window: 0 of 500 left · resets in 2h05m (21:05)
 ```
 
-`/cursor-usage` prints the same window, and says outright when nothing is known:
-*"Cursor reports no usage-limit RPC, so nothing is known until it refuses a call."*
-An absent line means *Cursor has not told us*, never *you have headroom*.
-
-Cursor's own desktop app does show weekly / rolling-window allotments; that comes
-from an internal API the SDK bundles and the bridge does not expose, so reading it
-here would mean scraping an undocumented endpoint with your key. Say the word if
-you want that anyway — it is opt-in territory, not a default.
-
-Scope, stated plainly because the protocol sets the limit: `sdk.v1` exposes usage
-per agent and no account-wide usage or plan-limit RPC (`SdkCursorService` has only
-`Me`, `ListModels`, `ListRepositories`). So the footer reads *what these agents
-consumed*, not *what the plan allows*. A fallback covers the case where the usage
-RPC is unavailable: the run's own usage frame, which has tokens but no cost.
+An absent window means *Cursor has not told us*, never *you have headroom*.
 
 ## How tool calls are displayed
 
@@ -175,10 +214,12 @@ extension.go, support.go   pig factory: provider registration, auth, /cursor-* c
 internal/bridge            bridge spawn, ready-line handshake, Connect framing, shutdown
 internal/cursor            typed sdk.v1 client, run coordinator, parked host tool callbacks, event decoder
 internal/provider          model catalog, pig transcript parsing, turn engine, display emitter
+internal/planusage         plan allowance through Cursor Desktop's login: read-only, opt-out
 proto/, gen/               sdk.v1 protos (vendored) and their generated Go
 docs/display-rules.md      the display contract, enforced by tests
 docs/evidence/             audit, live event capture, terminal capture, bridge resume log
-dev/                       live/multi-turn/PTY runners, bridge probes, benchmark
+dev/                       live/multi-turn/PTY/plan runners, bridge probes, benchmark
+cmd/planprobe              print plan numbers and timings without starting pig
 scripts/gen-fallback-catalog.py  refresh the embedded offline catalog snapshot
 ```
 
@@ -190,6 +231,8 @@ pig install . --validate-only --json
 ./dev/run-live.sh cursor/grok-4.7 "Use the bash tool to run exactly: echo hello-go. Then tell me what it printed."
 python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty-session.txt
 ./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
+./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
+go run ./cmd/planprobe            # plan numbers + timings, without starting pig
 ```
 
 ## Known limitations
@@ -199,9 +242,11 @@ python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty
 - `/cursor-abort` releases the run this pig process is holding. A run left active
   by a process that died is not cancelled eagerly: the next send notices the agent
   still owns an upstream run, releases it, and starts a clean one (logged at INFO).
-- No plan-limit data before a refusal: `sdk.v1` exposes usage limits only inside
-  error details, so weekly / rolling-window "X of Y used" cannot be read in
-  advance (see *Limits* above).
+- Plan limits depend on Cursor Desktop: an API key gets no limit data at all, so
+  the allowance line exists only where Cursor is installed and logged in, and
+  comes from Cursor's app API rather than a published contract (see *Plan usage*).
+  Rolling 5-hour windows are not exposed by either surface — only the billing
+  cycle is.
 - If Cursor answers with one of *its own* built-in tools instead of a host tool,
   no card renders — there is no host tool to attach one to. The footer says
   `Cursor ran Shell (its own tool)` instead; a transcript line for it would be

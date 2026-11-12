@@ -1,0 +1,4 @@
+Error: Failed to load extension "/Users/saintno/Sources/Lab/pig-cursor-sdk": Failed to load extension: Go extension /Users/saintno/Sources/Lab/pig-cursor-sdk contains both factory and standalone main packages; select one exact root
+Error: Model "cursor/grok-4.7" not found. Use --list-models to see available models.
+Hint: Start without extensions using "pig -ne".
+

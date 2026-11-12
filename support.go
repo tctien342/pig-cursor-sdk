@@ -1,6 +1,7 @@
 package pig_cursor_sdk
 
 import (
+	planusage "github.com/tctien342/pig-cursor-sdk/internal/planusage"
 	"io"
 	"log/slog"
 	"os"
@@ -82,4 +83,26 @@ func formatCost(cents float64, label string) string {
 		dollars += " raw"
 	}
 	return dollars
+}
+
+// formatPlan is the footer's plan line. Two cases, because "8% used" and "the
+// allowance is gone, you are on granted bonus" are different states, and the
+// second one is exactly when the number matters most.
+func formatPlan(snap *planusage.Snapshot) string {
+	if snap == nil {
+		return ""
+	}
+	pct := snap.PercentUsed
+	if pct <= 0 && snap.IncludedLimit > 0 {
+		pct = 100 * float64(snap.IncludedSpend) / float64(snap.IncludedLimit)
+	}
+	trimmed := strings.TrimSuffix(money(pct), ".0")
+	if snap.Exhausted() {
+		line := "plan " + trimmed + "% · included used"
+		if snap.BonusSpend > 0 {
+			line += " · $" + money(float64(snap.BonusSpend)/100) + " bonus"
+		}
+		return line
+	}
+	return "plan " + trimmed + "% · $" + money(float64(snap.Remaining())/100) + " left"
 }
