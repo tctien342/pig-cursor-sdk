@@ -241,6 +241,7 @@ proto/, gen/               sdk.v1 protos (vendored) and their generated Go
 docs/display-rules.md      the display contract, enforced by tests
 internal/provider/bar.go   the plan bar: fill, animation cap, width fitting
 internal/provider/cursortools.go  Cursor's own tool calls: one transcript line each
+internal/bridge                    bridge spawn, shutdown, and the orphan sweep (reap.go)
 docs/evidence/             audit, live event capture, terminal capture, bridge resume log
 dev/                       live/multi-turn/PTY/reload/plan runners, probes, benchmark — its own Go module
 scripts/gen-fallback-catalog.py  refresh the embedded offline catalog snapshot
@@ -266,6 +267,7 @@ dev/.venv/bin/python dev/tty-reload-check.py   # chat, /reload, and a turn after
 python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty-session.txt
 ./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
 dev/.venv/bin/python dev/tty-cursor-tools.py  # Cursor's own tools on screen: live, ctrl+o, and after resume
+dev/.venv/bin/python dev/tty-two-sessions.py  # sessions in one directory: one exits, the rest survive
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
 cd dev && go run ./cmd/planprobe  # plan numbers + timings, without starting pig
 ```
@@ -294,6 +296,12 @@ the hang is in [docs/evidence/tty-reload.txt](docs/evidence/tty-reload.txt).
   session entry, not model context, so it never reaches the transcript Cursor is
   replayed. Cursor reports no result text for these calls, so the line says what
   ran and how it ended, never what it printed. Disable with `PI_CURSOR_SHOW_TOOLS=0`.
+- Several pig sessions in one directory each need their own Cursor agent — Cursor
+  tolerates exactly one driver per agent — so only one of them resumes Cursor's
+  side of a conversation and the others replay it. Windows on the *same* session
+  file therefore have separate Cursor-side memories even though the transcript is
+  shared. Why, and what gets reaped when a session is killed:
+  [docs/sessions.md](docs/sessions.md).
 - Cost is reported as an estimate of zero with `totalFromProvider: false`: Cursor
   publishes token counts, not a per-run dollar amount.
 - Cursor's own account usage/quota is not exposed by `sdk.v1`, so there is no

@@ -35,7 +35,11 @@ func newLogger() *slog.Logger {
 	if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 		w = io.MultiWriter(os.Stderr, f)
 	}
-	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})).With("ext", "pig-cursor-sdk")
+	// pid, because several pig processes append to this one file, and a question
+	// like "did closing that session break this one?" cannot be answered without
+	// knowing which process wrote which line.
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})).
+		With("ext", "pig-cursor-sdk", "pid", os.Getpid())
 }
 
 // bridgeInstallDir is the directory holding the bridge binary; its parent is

@@ -71,6 +71,16 @@ func Spawn(ctx context.Context, bin, workspace string, extraEnv []string, toolCa
 	}
 
 	h := &Handle{Bin: bin, cmd: cmd, client: &http.Client{Timeout: 2 * time.Minute}}
+	// Recorded before anything else can go wrong: if this process is killed, a
+	// later one has to be able to find the bridge this one left behind.
+	register(StateDir(), bridgeRecord{
+		BridgePID:  cmd.Process.Pid,
+		BridgeBin:  bin,
+		OwnerPID:   os.Getpid(),
+		OwnerStart: lookProcess(os.Getpid()).Start,
+		Workspace:  workspace,
+		StartedAt:  time.Now().Unix(),
+	}, nil)
 	readyCh := make(chan Ready, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -259,6 +269,8 @@ func (h *Handle) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_, _, _ = h.Call(ctx, "sdk.v1.SdkBridgeControlService", "Shutdown", map[string]any{"graceSeconds": 1})
+
+	forgetBridge(StateDir(), h.cmd.Process.Pid)
 
 	done := make(chan struct{})
 	go func() { _ = h.cmd.Wait(); close(done) }()

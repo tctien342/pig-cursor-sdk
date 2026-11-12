@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/tctien342/pig-cursor-sdk/internal/bridge"
 )
 
 // agentRegistry keeps the Cursor agent id of each conversation branch on disk.
@@ -21,6 +23,12 @@ type agentRegistry struct {
 	mu   sync.Mutex
 	path string
 	doc  agentDoc
+
+	// ownerPID/ownerStart describe this process; owned reports whether a recorded
+	// owner is still the same running process. Both are replaced in tests.
+	ownerPID   int
+	ownerStart string
+	owned      func(pid int, start string) bool
 }
 
 type agentDoc struct {
@@ -33,6 +41,23 @@ type agentDoc struct {
 type agentRecord struct {
 	AgentID   string `json:"agentId"`
 	UpdatedAt int64  `json:"updatedAt"`
+
+	// OwnerPID and OwnerStart identify the process believed to hold this agent.
+	// An agent is not a shared resource: resuming one another session is still
+	// using means colliding with its run. OwnerStart is the process start time as
+	// of recording, since a pid that came back is a different process.
+	OwnerPID   int    `json:"ownerPid,omitempty"`
+	OwnerStart string `json:"ownerStart,omitempty"`
+}
+
+// ownership decides what to do with a recorded agent, and is a pure function of
+// the record so the rule is testable: an agent recorded by a live process belongs
+// to that process; anything else is free to take over.
+func (rec agentRecord) resumable(owned func(pid int, start string) bool) bool {
+	if rec.OwnerPID == 0 {
+		return true // written before ownership was recorded; no one can claim it
+	}
+	return !owned(rec.OwnerPID, rec.OwnerStart)
 }
 
 const agentRegistryTTL = 12 * time.Hour
@@ -45,6 +70,17 @@ func newAgentRegistry(dir string) *agentRegistry {
 		path: filepath.Join(dir, "agents.json"),
 		doc:  agentDoc{Version: 1, Agents: map[string]agentRecord{}},
 	}
+	r.ownerPID = os.Getpid()
+	r.ownerStart = bridge.ProcessStart(r.ownerPID)
+	// Our own pid never owns anything from our point of view: a reload closes the
+	// running engine's agents and builds a new one in the same process, and that
+	// new engine must still be able to resume what the previous one recorded.
+	r.owned = func(pid int, start string) bool {
+		if pid == r.ownerPID {
+			return false
+		}
+		return bridge.OwnerAlive(pid, start)
+	}
 	if raw, err := os.ReadFile(r.path); err == nil {
 		var doc agentDoc
 		if json.Unmarshal(raw, &doc) == nil && doc.Version == 1 && doc.Agents != nil {
@@ -54,8 +90,11 @@ func newAgentRegistry(dir string) *agentRegistry {
 	return r
 }
 
-// lookup returns a still-fresh agent id for a conversation key.
-func (r *agentRegistry) lookup(key string) (string, bool) {
+// lookup returns a still-fresh agent id for a conversation key, and whether that
+// agent is claimed by a process still running. A claimed agent must not be
+// resumed: the other session is talking to it, and two processes on one agent
+// means one of them is told "already has active run".
+func (r *agentRegistry) lookup(key string) (agentID string, free bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rec, ok := r.doc.Agents[registryKey(key)]
@@ -65,10 +104,14 @@ func (r *agentRegistry) lookup(key string) (string, bool) {
 	if time.Since(time.UnixMilli(rec.UpdatedAt)) > agentRegistryTTL {
 		return "", false
 	}
+	if !rec.resumable(r.owned) {
+		return rec.AgentID, false
+	}
 	return rec.AgentID, true
 }
 
-// remember stores the agent id of a conversation key.
+// remember stores the agent id of a conversation key, and claims it for this
+// process so a second session in the same directory picks its own agent instead.
 func (r *agentRegistry) remember(key, agentID string) {
 	if agentID == "" {
 		return
@@ -78,7 +121,12 @@ func (r *agentRegistry) remember(key, agentID string) {
 	if r.doc.Agents == nil {
 		r.doc.Agents = map[string]agentRecord{}
 	}
-	r.doc.Agents[registryKey(key)] = agentRecord{AgentID: agentID, UpdatedAt: time.Now().UnixMilli()}
+	r.doc.Agents[registryKey(key)] = agentRecord{
+		AgentID:    agentID,
+		UpdatedAt:  time.Now().UnixMilli(),
+		OwnerPID:   r.ownerPID,
+		OwnerStart: r.ownerStart,
+	}
 	r.doc.UpdatedAt = time.Now().UnixMilli()
 	r.saveLocked()
 }

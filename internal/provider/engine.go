@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 
+	"github.com/tctien342/pig-cursor-sdk/internal/bridge"
 	cursor "github.com/tctien342/pig-cursor-sdk/internal/cursor"
 	planusage "github.com/tctien342/pig-cursor-sdk/internal/planusage"
 )
@@ -45,6 +48,11 @@ type Engine struct {
 	startErr string
 	override ModelOverride
 	agents   *agentRegistry
+
+	// nonce separates throwaway sessions from each other; reaped stops the bridge
+	// sweep from running on every turn. See sessionKey and Client.
+	nonce  string
+	reaped bool
 
 	// plan is Cursor's plan-usage picture, read through Cursor Desktop's login
 	// when that exists. Nil until it has been read successfully once.
@@ -104,6 +112,11 @@ type Session struct {
 	// sentFingerprints is the transcript prefix already fed to the agent, used
 	// to detect an append-only continuation versus a rewritten branch.
 	sentFingerprints []string
+
+	// prevFingerprints is what sentFingerprints was before the last send, so a
+	// send that never reached the agent can be retried instead of being read as
+	// a rewritten conversation.
+	prevFingerprints []string
 
 	// pending are host tool calls the run is parked on, in arrival order.
 	pending []pendingRef
@@ -391,10 +404,16 @@ func NewEngine(cfg Config) *Engine {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	nonce := make([]byte, 6)
+	if _, err := rand.Read(nonce); err != nil {
+		// Only ever used to keep two throwaway sessions apart.
+		nonce = []byte(strconv.FormatInt(time.Now().UnixNano(), 10))
+	}
 	return &Engine{
 		cfg:      cfg,
 		sessions: map[string]*Session{},
 		agents:   newAgentRegistry(DefaultStateDir(cfg.ConfigHome)),
+		nonce:    hex.EncodeToString(nonce),
 	}
 }
 
@@ -425,6 +444,15 @@ func (e *Engine) Client(ctx context.Context, apiKey string) (*cursor.Client, err
 	bin := e.cfg.BridgeBin
 	if bin == "" {
 		bin = cursor.FindBinary()
+	}
+	if !e.reaped {
+		// Bridges only serve the process that started them. A session that was
+		// killed leaves one holding a port and a live Cursor run, which makes that
+		// agent refuse every later send — clear those before starting ours.
+		if n := bridge.ReapStale(DefaultStateDir(e.cfg.ConfigHome), e.cfg.Logger); n > 0 && e.cfg.Logger != nil {
+			e.cfg.Logger.Info("reaped bridges left by dead sessions", "count", n)
+		}
+		e.reaped = true
 	}
 	started := time.Now()
 	c, err := cursor.New(ctx, cursor.Options{
@@ -520,8 +548,15 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 		e.sessions[key] = sess
 		// A pig session resumed in a new process has no live agent here. The
 		// recorded id lets Cursor restore its own run state instead of replaying
-		// the whole transcript.
-		sess.AgentID, _ = e.agents.lookup(key)
+		// the whole transcript — unless another process still holds that agent, in
+		// which case taking it would collide with a turn in progress.
+		if id, free := e.agents.lookup(key); id != "" {
+			if free {
+				sess.AgentID = id
+			} else {
+				e.cfg.Logger.Info("another live session owns this conversation's cursor agent; using a separate one", "agent", id)
+			}
+		}
 	}
 	e.mu.Unlock()
 
@@ -545,12 +580,18 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 			e.fail(stream, model, modelID, err)
 			return
 		}
-		if out := e.consume(ctx, stream, model, entry, sess, run, debugStream, piCtx.Tools); out.retry && attempt == 0 {
-			e.resetSession(ctx, sess)
+		out := e.consume(ctx, stream, model, entry, sess, run, debugStream, piCtx.Tools)
+		if attempt == 0 && (out.retry || out.recover) {
+			if out.recover {
+				// The agent is usable now; the transcript it never received goes
+				// back on the wire, and nothing else has to change.
+				sess.undoSend()
+			} else {
+				e.resetSession(ctx, sess)
+			}
 			continue
-		} else {
-			return
 		}
+		return
 	}
 }
 
@@ -670,6 +711,18 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		sess.overrideSig = overrideSignature(entry, ov)
 	}
 
+	// Which agent this conversation is on, and how it was obtained: two sessions
+	// in one directory share the registry and Cursor's per-project agent store, so
+	// this line is what turns "the other session broke" into a traceable event.
+	agentKind := "live"
+	switch {
+	case sess.agent == nil && sess.AgentID != "":
+		agentKind = "resume"
+	case sess.agent == nil:
+		agentKind = "create"
+	}
+	e.cfg.Logger.Debug("agent decision", "key", registryKey(sess.Key)[:8], "kind", agentKind, "agent", sess.AgentID)
+
 	agent := sess.agent
 	if agent != nil && sess.toolSig != toolSig {
 		// The tool set changed; the agent's advertised tools must change with it.
@@ -724,6 +777,7 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		return e.startTurn(ctx, sess, client, apiKey, entry, piCtx, debug)
 	}
 
+	sess.prevFingerprints = sess.sentFingerprints
 	sess.sentFingerprints = fingerprints(piCtx)
 	return agent.Send(goCtx(ctx), newText, images(piCtx.Images()))
 }
@@ -734,7 +788,12 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 // turnOutcome reports whether the caller should retry the turn with a clean
 // session. Only a failure that happens before any content reached the host can
 // be retried, so a retry never duplicates a partially streamed message.
-type turnOutcome struct{ retry bool }
+type turnOutcome struct {
+	retry bool
+	// recover means the same agent became usable again (a leftover run was
+	// cancelled), so the turn is re-sent without losing Cursor's context.
+	recover bool
+}
 
 func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) turnOutcome {
 	em := newTurnEmitter(model, entry)
@@ -805,8 +864,18 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	if err := run.DrainErr(); err != nil {
 		if isStaleAgentError(err) && !em.sawContent() {
 			// The agent we restored from disk still owns a run upstream that this
-			// process cannot see — typical after an interrupted session. Release it
-			// and let the caller start a clean agent instead of showing an error.
+			// process cannot see — typical after an interrupted session. Show no
+			// error either way; the question is only how much is thrown away.
+			if sess.agent != nil {
+				if n, rerr := sess.agent.ReleaseStaleRuns(goCtx(ctx)); rerr == nil && n > 0 {
+					// A dead session's run, cancelled: this agent and everything
+					// Cursor remembers about this conversation survive.
+					e.cfg.Logger.Info("cancelled the run another session left on this cursor agent", "runs", n, "agent", sess.AgentID)
+					return turnOutcome{recover: true}
+				} else if rerr != nil {
+					e.cfg.Logger.Debug("could not release the stale cursor run", "err", rerr)
+				}
+			}
 			e.cfg.Logger.Info("restored cursor agent still holds an upstream run; starting a fresh one", "err", err)
 			return turnOutcome{retry: true}
 		}
@@ -862,6 +931,14 @@ func isStaleAgentError(err error) bool {
 
 // appendedText reports the new user text when pig's transcript extends what we
 // already sent, and false when the branch diverged.
+// undoSend restores the transcript bookkeeping after a send the agent never
+// received, so the retry re-sends that text instead of concluding the branch was
+// rewritten and rebuilding the agent from scratch.
+func (s *Session) undoSend() {
+	s.sentFingerprints = s.prevFingerprints
+	s.prevFingerprints = nil
+}
+
 func (s *Session) appendedText(piCtx PiContext) (string, bool) {
 	fps := fingerprints(piCtx)
 	if len(s.sentFingerprints) == 0 {
@@ -899,7 +976,21 @@ func (e *Engine) sessionKey(ctx sdk.Context, entry *ModelEntry) string {
 	if f, err := ctx.GetSessionFile(); err == nil && f != nil {
 		file = *f
 	}
-	return strings.Join([]string{file, cwd, entry.BaseID}, "\x00")
+	return conversationKey(file, cwd, entry.BaseID, e.nonce)
+}
+
+// conversationKey identifies one conversation for the purpose of reusing a Cursor
+// agent. A session file is durable identity; without one, the per-process nonce is
+// what keeps two throwaway runs apart. They must be apart: with no file, every run
+// in one directory would otherwise compute the same key, fight over one agent, get
+// told "already has active run", and have that agent closed under it when the other
+// run exits.
+func conversationKey(sessionFile, cwd, baseID, nonce string) string {
+	file := sessionFile
+	if strings.TrimSpace(file) == "" {
+		file = "ephemeral:" + nonce
+	}
+	return strings.Join([]string{file, cwd, baseID}, "\x00")
 }
 
 func (e *Engine) resolveAPIKey(ctx sdk.Context, options map[string]any) string {
