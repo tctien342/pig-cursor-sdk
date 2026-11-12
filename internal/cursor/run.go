@@ -188,7 +188,7 @@ func (a *Agent) Send(ctx context.Context, text string, images []Image) (*Run, er
 		return nil, err
 	}
 
-	msg := &sdkpb.UserMessage{Text: text}
+	msg := &sdkpb.UserMessage{Text: validText(text)}
 	for _, img := range images {
 		msg.Images = append(msg.Images, &sdkpb.SdkImage{
 			Source: &sdkpb.SdkImage_Data{Data: &sdkpb.SdkImageData{Data: img.Data, MimeType: img.MIMEType}},

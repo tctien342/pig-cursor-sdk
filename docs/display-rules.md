@@ -38,6 +38,21 @@ into pig provider events, so the rules are one place, testable without a bridge.
    a classified message ("Cursor did not respond within 5m; the run was released"),
    never a stack or a raw payload.
 
+## UTF-8 fallback
+
+Human-readable decoded event text (prose, thinking, status messages, terminal
+answers/errors and tool-result text) replaces malformed byte sequences with `�`.
+Valid multilingual text is unchanged. The fallback copies nested event values;
+it does not mutate the producer's data or rewrite routing IDs, offsets, tool names
+or binary/structured payloads. Outbound prompt text is repaired before protobuf
+serialization, and replay truncation preserves UTF-8 character boundaries.
+
+This fallback is lossy, not encoding detection: malformed bytes cannot be recovered
+as their original characters. It also cannot repair a malformed protobuf frame
+rejected by the wire decoder before an event exists, nor does it reassemble broken
+characters across separate events. Machine/protocol fields remain unchanged and may
+still be rejected by downstream validation or serialization.
+
 ## Enforcement
 
 `internal/provider/emit_test.go`:

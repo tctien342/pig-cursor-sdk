@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 func jsonUnmarshal(raw []byte, v any) error { return json.Unmarshal(raw, v) }
@@ -307,10 +308,17 @@ func jsonCompact(v any) string {
 	return string(raw)
 }
 
+// truncate keeps the existing byte budget but never splits a Unicode character.
+// Replay prompts go into protobuf string fields, which reject invalid UTF-8.
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
+	// Also repair malformed source text before length checks, including unlimited
+	// and short input. Valid text is unchanged; bad byte sequences become U+FFFD.
+	s = strings.TrimSpace(strings.ToValidUTF8(s, "\uFFFD"))
 	if n <= 0 || len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "…[truncated]"
 }

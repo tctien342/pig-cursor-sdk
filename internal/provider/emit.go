@@ -65,6 +65,7 @@ func (t *turnEmitter) begin() { t.push(map[string]any{"type": "start"}) }
 // add translates one run event. stop=true means the provider turn is over
 // because a host tool call was handed to the host.
 func (t *turnEmitter) add(ev cursor.RunEvent) (stop bool) {
+	ev.Event = ev.Event.WithValidText()
 	switch ev.Kind {
 	case cursor.EventThinkingDelta:
 		if ev.Text == "" {
@@ -175,6 +176,7 @@ func (t *turnEmitter) hostToolCall(ev cursor.RunEvent) bool {
 
 // statusFailure reports a run-level failure the host must see as an error.
 func (t *turnEmitter) statusFailure(ev cursor.RunEvent) (string, bool) {
+	ev.Event = ev.Event.WithValidText()
 	if ev.Kind != cursor.EventStatus || ev.Status == nil {
 		return "", false
 	}
@@ -192,6 +194,7 @@ func (t *turnEmitter) statusFailure(ev cursor.RunEvent) (string, bool) {
 // on a host tool call, whose final text arrives on the result frame rather than
 // as deltas.
 func (t *turnEmitter) finish(reason string, terminal *cursor.RunResult) string {
+	terminal = (cursor.Event{Result: terminal}).WithValidText().Result
 	if t.cursorTools != nil {
 		for _, id := range t.cursorTools.order {
 			call := t.cursorTools.calls[id]

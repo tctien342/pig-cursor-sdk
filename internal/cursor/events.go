@@ -173,7 +173,12 @@ type TaskEvent struct {
 // Decode turns one run-stream message into events. An empty envelope is a
 // keepalive and yields nothing; unknown cases are skipped silently, which is
 // the forward-compatibility rule the protocol requires.
-func Decode(msg *sdkpb.RunStreamMessage, deltasEnabled bool) []Event {
+func Decode(msg *sdkpb.RunStreamMessage, deltasEnabled bool) (events []Event) {
+	defer func() {
+		for i := range events {
+			events[i] = events[i].WithValidText()
+		}
+	}()
 	if msg == nil {
 		return nil
 	}
