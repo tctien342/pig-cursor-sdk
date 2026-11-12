@@ -12,7 +12,7 @@
 - Run only tests relevant to the changes, never an unrelated full-repository suite.
 - Do not fake Cursor-internal activity as executable pig tools.
 - Do not resend a prompt after ambiguous delivery or claim remote cancellation without evidence.
-- No locks across network or host calls; no credentials/prompts/tool output in diagnostics.
+- No state/engine registry locks across network or host calls; per-session turn serialization and per-run cancellation serialization remain explicit. No credentials/prompts/tool output in diagnostics.
 - Mark each user-requested task complete only against concrete implementation and tests.
 
 ### Task 1: Continuity
@@ -26,28 +26,33 @@
 ### Task 2: Cancellation
 **Files:** cursor run.go/new cancellation helpers+tests; provider scoped cancellation helpers; extension command.
 **Interfaces:** context-aware per-run cancellation, run status snapshot, AbortScope by session file+cwd+ephemeral nonce, not cwd alone.
-- [ ] Make /cursor-abort operate only on the current logical session and report local stop versus upstream failure accurately.
-- [ ] Serialize session pumps while allowing cancellation to reach the active owned run without waiting for the pump lock.
-- [ ] Stop/Close release active work with bounded RPCs outside engine locks; propagate Escape/caller cancellation.
-- [ ] Test two sessions in one cwd, failed cancellation/retry, already completed runs, callbacks released and concurrent teardown with race checks.
+- [x] Make /cursor-abort operate only on the current logical session and report local stop versus upstream failure accurately.
+- [x] Serialize session pumps while allowing cancellation to reach the active owned run without waiting for the pump lock.
+- [x] Stop/Close release active work with bounded RPCs outside engine locks; propagate Escape/caller cancellation.
+- [x] Test two sessions in one cwd, failed cancellation/retry, already completed runs, callbacks released and concurrent teardown with race checks.
 
 ### Task 3: Tool fidelity
 **Files:** cursor callback result conversion and provider tool-outcome parsing/tests.
-- [ ] Preserve actual native pig tool text and isError, including empty successful results, without turning an ordinary tool error into a callback transport failure.
-- [ ] Verify bridge interpretation of result fields before emitting new structured/image shapes; explicitly report unsupported features rather than pretending parity.
-- [ ] Keep native cards and result/expansion transcript data untouched; test error, cancellation and replay paths.
+- [x] Preserve actual native pig tool text and isError, including empty successful results, without turning an ordinary tool error into a callback transport failure.
+- [x] Verify bridge interpretation of result fields before emitting new structured/image shapes; explicitly report unsupported features rather than pretending parity.
+- [x] Keep native cards and result/expansion transcript data untouched; test error, cancellation and replay paths.
 
 ### Task 4: Model controls
 **Files:** provider catalog.go, controls.go, controls_test.go; engine wrapper integration; extension option precedence.
 **Interfaces:** resolvedParams(entry,override) and canonicalParamSignature(params), explicit per-level parameter changes.
-- [ ] Fix off across boolean thinking+effort, extra-high aliases, none/off, and explicit option precedence.
-- [ ] Fix explicit context versus generic cache precedence, fast-mode window equivalence, canonical signatures and default-context aliases.
-- [ ] Assert actual outgoing params for embedded/synthetic models; preserve defaults and clearly report unsupported controls.
+- [x] Fix off across boolean thinking+effort, extra-high aliases, none/off, and explicit option precedence.
+- [x] Fix explicit context versus generic cache precedence, fast-mode window equivalence, canonical signatures and default-context aliases.
+- [x] Assert actual outgoing params for embedded/synthetic models; preserve defaults and clearly report unsupported controls.
 
 ### Task 5: Diagnostics
 **Files:** provider doctor.go/tests; extension /cursor-doctor; docs/evidence.
 **Interfaces:** passive diagnostic snapshot plus opt-in bounded probe of an existing client.
-- [ ] Report active tools/count, bridge state, selected model/effective controls, current scope run state, recent reconnect/cancel failures and actionable next steps.
-- [ ] Default diagnosis must not start a bridge, create agents, read credentials or emit prompts/private tool arguments.
-- [ ] Test idle/missing bridge, live run, failure states, redaction and zero-start behavior.
-- [ ] Run focused suites, selected race checks, build/vet and scoped CLI/PTY checks, review and commit each completed area.
+- [x] Report active tools/count, bridge state, selected model/effective controls, current scope run state, recent reconnect/cancel failures and actionable next steps.
+- [x] Default diagnosis must not start a bridge, create agents, read credentials or emit prompts/private tool arguments.
+- [x] Test idle/missing bridge, live run, failure states, redaction and zero-start behavior.
+- [x] Run focused suites, selected race checks, build/vet and scoped CLI/PTY checks, review and commit completed areas.
+
+Evidence: [native-cursor-models.txt](../evidence/native-cursor-models.txt). Continuity
+is committed separately as `707b2c0`; the remaining tightly integrated areas ship
+together with their focused regressions. The host/legacy Go-SDK cancellation
+record limitation is documented rather than rewritten or claimed as parity.

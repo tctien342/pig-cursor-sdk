@@ -34,8 +34,10 @@ type ModelEntry struct {
 	// ThinkingLevels maps a pig thinking level to the Cursor parameter value.
 	ThinkingLevels  map[string]string
 	ThinkingParamID string
-	SupportsFast    bool
-	DefaultFast     bool
+	// ThinkingEdits contains parameter-aware edits for each supported host level.
+	ThinkingEdits map[string][]Param
+	SupportsFast  bool
+	DefaultFast   bool
 }
 
 // Param is one model parameter selection.
@@ -146,11 +148,28 @@ func BuildCatalog(items []*sdkpb.SdkModel, contextWindows map[string]int) *Catal
 					if levels, pid := thinkingLevels(m); len(levels) > 0 {
 						entry.ThinkingLevels = levels
 						entry.ThinkingParamID = pid
+						_, _, entry.ThinkingEdits = thinkingControls(m)
 						entry.Reasoning = true
 					}
 					entry.ContextWindow = contextWindowFor(contextWindows, entry, ctxv, base, sel, fast, defaultFast)
 					c.Entries = append(c.Entries, *entry)
 					c.byID[entry.ID] = &c.Entries[len(c.Entries)-1]
+				}
+			}
+		}
+	}
+	// Reindex after appending so lookups point into the final Entries slice.
+	for i := range c.Entries {
+		c.byID[c.Entries[i].ID] = &c.Entries[i]
+	}
+	// Bare native IDs are lookup-only aliases, not additional menu entries.
+	for _, m := range sorted {
+		ctxv := paramValue(defaultParams(m), "context")
+		for _, fast := range []string{"", "true", "false"} {
+			alias := encodeID(m.GetId(), "", fast)
+			if c.byID[alias] == nil {
+				if entry := c.byID[encodeID(m.GetId(), ctxv, fast)]; entry != nil {
+					c.byID[alias] = entry
 				}
 			}
 		}
@@ -168,11 +187,6 @@ func contextWindowFor(cache map[string]int, e *ModelEntry, ctxv, base, sel, fast
 	if defaultEquivalent {
 		keys = append(keys, encodeID(sel, ctxv, ""))
 	}
-	keys = append(keys, encodeID(base, ctxv, ""))
-	if ctxv != "" {
-		keys = append(keys, base)
-	}
-	keys = append(keys, "default")
 	for _, k := range keys {
 		if v, ok := cache[k]; ok && v > 0 {
 			return v
@@ -181,6 +195,16 @@ func contextWindowFor(cache map[string]int, e *ModelEntry, ctxv, base, sel, fast
 	if ctxv != "" {
 		if n, ok := parseContextAmount(ctxv); ok {
 			return n
+		}
+	}
+	// Broad measurements must not override an explicit advertised context.
+	keys = []string{"default"}
+	if fast == "" || defaultEquivalent {
+		keys = append([]string{base}, keys...)
+	}
+	for _, k := range keys {
+		if v := cache[k]; v > 0 {
+			return v
 		}
 	}
 	return fallbackContextWindow
@@ -275,53 +299,8 @@ func replaceParam(params []Param, id, value string) []Param {
 // parameter, which differs per model family (reasoning, effort, thinking,
 // reasoning_effort).
 func thinkingLevels(m *sdkpb.SdkModel) (map[string]string, string) {
-	ids := []string{"effort", "reasoning", "reasoning_effort", "thinking"}
-	var chosen *sdkpb.ModelParameterDefinition
-	var chosenID string
-	for _, id := range ids {
-		if p := parameter(m, id); p != nil {
-			chosen, chosenID = p, id
-			break
-		}
-	}
-	if chosen == nil {
-		return nil, ""
-	}
-	if chosenID == "thinking" && hasBooleanValues(chosen) {
-		return map[string]string{"off": "false", "high": "true"}, chosenID
-	}
-	levels := map[string]string{}
-	want := map[string]string{
-		"minimal": "minimal", "low": "low", "medium": "medium",
-		"high": "high", "xhigh": "xhigh", "max": "max",
-	}
-	for _, v := range chosen.GetValues() {
-		val := v.GetValue()
-		if out, ok := want[val]; ok {
-			levels[out] = val
-		}
-	}
-	if p := parameter(m, "reasoning"); p != nil {
-		for _, v := range p.GetValues() {
-			switch v.GetValue() {
-			case "none", "off":
-				levels["off"] = v.GetValue()
-			}
-		}
-	}
-	if p := parameter(m, "thinking"); p != nil {
-		for _, v := range p.GetValues() {
-			if v.GetValue() == "false" {
-				if _, ok := levels["off"]; !ok {
-					levels["off"] = "false"
-				}
-			}
-		}
-	}
-	if len(levels) == 0 {
-		return nil, chosenID
-	}
-	return levels, chosenID
+	levels, id, _ := thinkingControls(m)
+	return levels, id
 }
 
 // encodeID builds the pig model id: base[@context][:fast|:slow].

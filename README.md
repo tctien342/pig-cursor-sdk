@@ -72,13 +72,17 @@ pig --model cursor/claude-opus-5-5@1m:fast -p "…"
 
 Model ids are `cursor/<base>[@<context>][:fast|:slow]`, built from the live Cursor
 catalog (`/cursor-refresh-models` re-reads it without restarting). Thinking level
-maps onto the model's own reasoning parameter.
+maps onto the model's own supported parameters. Explicit selections are preserved;
+unsupported levels retain defaults and warn. See [native-model behavior](docs/native-cursor-models.md)
+for continuity, cancellation, tool-result fidelity and control limitations.
 
 | command | what it does |
 | --- | --- |
 | `/cursor-refresh-models` | re-read the catalog through the bridge, cache it, re-register |
 | `/cursor-mode plan\|agent` | Cursor plan mode vs agent mode |
-| `/cursor-abort` | release the Cursor run live in *this* pig process (completed host work is not undone) |
+| `/cursor-abort` | stop this logical session's owned runs; report whether upstream cancellation was acknowledged |
+| `/cursor-fast on\|off\|default` | select a registered fast-mode variant with matching context metadata |
+| `/cursor-doctor [--probe]` | passive scoped diagnostics; optionally ping an existing bridge without starting one |
 | `/cursor-usage` | tokens and cost Cursor reports for this session's agents |
 | `/cursor-status` | bridge pid, catalog size, mode, key presence, tool mode, usage |
 | `/cursor-login` | store an API key |
@@ -266,7 +270,7 @@ is everyone else's extension failing to start.
 ## Verification
 
 ```bash
-go test ./...                     # 45 tests: coordinator, decoder against real frames, display rules, state locking
+go test . ./internal/cursor ./internal/provider # affected extension/provider/transport packages
 pig install . --validate-only --json
 ./dev/run-live.sh cursor/grok-4.7 "Use the bash tool to run exactly: echo hello-go. Then tell me what it printed."
 dev/.venv/bin/python dev/tty-reload-check.py   # chat, /reload, and a turn after reload — fails on a hang
@@ -276,6 +280,9 @@ python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty
 dev/.venv/bin/python dev/tty-inline-tools.py  # inline order, one running hint, saved metadata and resume
 dev/.venv/bin/python dev/tty-tool-style.py    # offline: internal card padding + native bash card
 dev/.venv/bin/python dev/tty-host-tool.py     # live: pig bash executes and returns a native tool result
+dev/.venv/bin/python dev/tty-host-tool.py --error # live: ordinary failure remains a native tool result
+dev/.venv/bin/python dev/tty-cursor-doctor.py # offline doctor/fast commands; no model turn
+dev/.venv/bin/python dev/tty-cancel-check.py  # live Escape + /cursor-abort, then new turns
 dev/.venv/bin/python dev/tty-two-sessions.py  # sessions in one directory: one exits, the rest survive
 dev/.venv/bin/python dev/tty-interrupt.py    # a message sent while Cursor is working still gets an answer
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
@@ -292,8 +299,13 @@ the hang is in [docs/evidence/tty-reload.txt](docs/evidence/tty-reload.txt).
 
 - Model aliases the TypeScript extension invented (`auto`, `composer`,
   `fable-5-2@1m`) are not part of `sdk.v1`; only canonical Cursor ids are offered.
-- `/cursor-abort` releases the run this pig process is holding. A run left active
-  by a process that died is not cancelled eagerly: the next send notices the agent
+- The current host/legacy Go SDK records an interrupted provider request as
+  `error: context canceled`, even when upstream cancellation is acknowledged and
+  the next turn succeeds. The extension does not rewrite that host transcript.
+- Cancellation acknowledgments cannot undo completed host work or guarantee every
+  external child process has exited. Failed upstream cancellation is reported and
+  retryable with `/cursor-abort`, scoped to the current logical session. A run left
+  active by a process that died is not cancelled eagerly: the next send notices the agent
   still owns an upstream run, releases it, and starts a clean one (logged at INFO).
 - Plan limits depend on Cursor Desktop: an API key gets no limit data at all, so
   the allowance line exists only where Cursor is installed and logged in, and

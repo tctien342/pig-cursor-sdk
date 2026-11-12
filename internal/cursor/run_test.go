@@ -163,7 +163,7 @@ func TestParkedCallSurvivesProviderBoundary(t *testing.T) {
 		if o.err != nil {
 			t.Fatalf("park returned error: %v", o.err)
 		}
-		if o.m["content"] != "hello from host" {
+		if payloadText(o.m) != "hello from host" {
 			t.Errorf("resolved payload = %v", o.m)
 		}
 	case <-time.After(2 * time.Second):
@@ -248,7 +248,7 @@ func TestConcurrentCallbacksResolvesIndependently(t *testing.T) {
 				return
 			}
 			mu.Lock()
-			results[id], _ = m["content"].(string)
+			results[id] = payloadText(m)
 			mu.Unlock()
 		}(id)
 	}
@@ -379,7 +379,7 @@ func TestToolResultIsAlwaysAnObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := st.AsMap()["content"]; got != "plain text result" {
+	if got := payloadText(st.AsMap()); got != "plain text result" {
 		t.Fatalf("tool result payload = %v", st.AsMap())
 	}
 }

@@ -28,11 +28,22 @@ PROMPT = ("First say 'Starting the check.' in normal text. Then run the shell co
 
 
 class Terminal:
-    def __init__(self, args):
+    def __init__(self, args, agent_dir=None):
         env = dict(os.environ, TERM="xterm-256color")
+        if agent_dir is not None:
+            env["PIG_CODING_AGENT_DIR"] = str(agent_dir)
         if not env.get("CURSOR_API_KEY"):
             auth = json.loads((Path.home() / ".pig/agent/auth.json").read_text())
             env["CURSOR_API_KEY"] = auth["cursor"]["key"]
+        if agent_dir is not None:
+            # Custom-provider host admission reads auth.json before invoking the
+            # extension. Copy only this test's Cursor credential, never the full
+            # user auth/settings file; the owning TemporaryDirectory removes it.
+            isolated = Path(agent_dir)
+            isolated.mkdir(mode=0o700, parents=True, exist_ok=True)
+            auth_fd = os.open(isolated / "auth.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(auth_fd, "w") as auth_file:
+                json.dump({"cursor": {"type": "api_key", "key": env["CURSOR_API_KEY"]}}, auth_file)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(ROOT)

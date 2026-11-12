@@ -14,11 +14,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 
-	"github.com/tctien342/pig-cursor-sdk/internal/bridge"
 	cursor "github.com/tctien342/pig-cursor-sdk/internal/cursor"
 	planusage "github.com/tctien342/pig-cursor-sdk/internal/planusage"
 )
@@ -45,13 +45,20 @@ type Config struct {
 type Engine struct {
 	cfg Config
 
-	mu       sync.Mutex
-	client   *cursor.Client
-	catalog  *Catalog
-	sessions map[string]*Session
-	startErr string
-	override ModelOverride
-	agents   *agentRegistry
+	mu            sync.Mutex
+	client        *cursor.Client
+	starting      *clientInitialization
+	newClient     func(context.Context, cursor.Options) (*cursor.Client, error)
+	closeClient   func(*cursor.Client)
+	catalog       *Catalog
+	sessions      map[string]*Session
+	startErr      string
+	stopped       bool
+	stopDone      chan struct{}
+	diagnosticsMu sync.Mutex
+	recent        []DiagnosticEvent
+	override      ModelOverride
+	agents        *agentRegistry
 
 	// nonce separates throwaway sessions from each other; reaped stops the bridge
 	// sweep from running on every turn. See sessionKey and Client.
@@ -83,35 +90,23 @@ func (e *Engine) SetModelOverride(o ModelOverride) {
 	e.mu.Unlock()
 }
 
-// AbortLiveRuns releases every live run this process owns: the Cursor run is
-// cancelled and parked host calls are released. Completed host work is not
-// undone; that is stated to the user by the command.
-func (e *Engine) AbortLiveRuns() bool {
-	e.mu.Lock()
-	sessions := make([]*Session, 0, len(e.sessions))
-	for _, s := range e.sessions {
-		sessions = append(sessions, s)
-	}
-	e.mu.Unlock()
-	released := false
-	for _, s := range sessions {
-		if s.agent == nil {
-			continue
-		}
-		if run := s.agent.Active(); run != nil && !run.Finished() {
-			_ = run.CancelRun("aborted by the user")
-			released = true
-		}
-	}
-	return released
-}
-
 // Session is one conversation's Cursor state.
 type Session struct {
 	Key string
 
-	AgentID string
-	agent   *cursor.Agent
+	AgentID         string // turn-owner bookkeeping; diagnostics use the atomic agent
+	agentSlot       atomic.Pointer[cursor.Agent]
+	turnMu          sync.Mutex
+	gate            sync.Mutex
+	abortGeneration uint64
+	turnGeneration  uint64
+	turnOverride    ModelOverride
+	controlReport   *ControlReport
+	requestDone     <-chan struct{}
+	recent          []DiagnosticEvent
+	lastDiagnostic  string
+	turnContext     context.Context
+	turnCancel      context.CancelFunc
 
 	// sentFingerprints is the transcript prefix already fed to the agent, used
 	// to detect an append-only continuation versus a rewritten branch.
@@ -366,6 +361,7 @@ func (e *Engine) reportUsage(sess *Session, terminal *cursor.RunResult) {
 		defer cancel()
 		rep, err := client.Usage(uctx, sess.AgentID)
 		if err == nil && rep != nil {
+			e.mu.Lock()
 			sess.usage = UsageTotals{
 				TotalTokens:  orInt(rep.Tokens.TotalTokens, rep.Tokens.InputTokens+rep.Tokens.OutputTokens),
 				InputTokens:  rep.Tokens.InputTokens,
@@ -376,13 +372,16 @@ func (e *Engine) reportUsage(sess *Session, terminal *cursor.RunResult) {
 				Runs:         rep.Runs,
 				Reported:     true,
 			}
+			e.mu.Unlock()
 			return
 		} else if err != nil {
 			e.cfg.Logger.Debug("cursor usage report unavailable", "err", err)
 		}
 	}
 	if snapshot.Reported {
+		e.mu.Lock()
 		sess.usage = snapshot
+		e.mu.Unlock()
 	}
 }
 
@@ -437,59 +436,52 @@ func (e *Engine) Catalog() *Catalog {
 
 // Client returns the running bridge client, starting it on first use.
 func (e *Engine) Client(ctx context.Context, apiKey string) (*cursor.Client, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.client != nil {
-		return e.client, nil
-	}
-	if e.startErr != "" {
-		return nil, errors.New(e.startErr)
-	}
-	bin := e.cfg.BridgeBin
-	if bin == "" {
-		bin = cursor.FindBinary()
-	}
-	if !e.reaped {
-		// Bridges only serve the process that started them. A session that was
-		// killed leaves one holding a port and a live Cursor run, which makes that
-		// agent refuse every later send — clear those before starting ours.
-		if n := bridge.ReapStale(DefaultStateDir(e.cfg.ConfigHome), e.cfg.Logger); n > 0 && e.cfg.Logger != nil {
-			e.cfg.Logger.Info("reaped bridges left by dead sessions", "count", n)
-		}
-		e.reaped = true
-	}
-	started := time.Now()
-	c, err := cursor.New(ctx, cursor.Options{
-		BridgeBin: bin,
-		Workspace: e.cfg.Workspace,
-		APIKey:    apiKey,
-		Logger:    e.cfg.Logger,
-	})
-	if err != nil {
-		e.startErr = err.Error()
-		return nil, err
-	}
-	e.cfg.Logger.Info("cursor bridge started", "ms", time.Since(started).Milliseconds(), "pid", c.PID())
-	e.client = c
-	return c, nil
+	return e.startClient(ctx, apiKey)
 }
 
-// Stop shuts the bridge down.
+// Stop cancels initialization and shuts ready resources down. A late startup
+// handle is disposed by its initializer without blocking Stop on startup.
 func (e *Engine) Stop() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	for _, s := range e.sessions {
-		if s.agent != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_ = s.agent.Close(ctx)
-			cancel()
-			s.agent = nil
+	if e.stopped {
+		done := e.stopDone
+		e.mu.Unlock()
+		if done != nil {
+			<-done
 		}
+		return
 	}
-	if e.client != nil {
-		e.client.Close()
-		e.client = nil
+	e.stopped = true
+	e.stopDone = make(chan struct{})
+	defer close(e.stopDone)
+	sessions := make([]*Session, 0, len(e.sessions))
+	for _, session := range e.sessions {
+		sessions = append(sessions, session)
 	}
+	client := e.client
+	starting := e.starting
+	e.client = nil
+	e.mu.Unlock()
+	if starting != nil {
+		starting.cancel()
+	}
+	var closing sync.WaitGroup
+	for _, session := range sessions {
+		session.abortTarget()
+		agent := session.agentSlot.Swap(nil)
+		if agent == nil {
+			continue
+		}
+		closing.Add(1)
+		go func(agent *cursor.Agent) {
+			defer closing.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = agent.Close(ctx)
+		}(agent)
+	}
+	closing.Wait()
+	e.disposeClient(client)
 }
 
 // BridgePID reports the live bridge pid, 0 when none.
@@ -504,12 +496,26 @@ func (e *Engine) BridgePID() int {
 
 // Stream is the provider implementation pig calls for every model turn.
 func (e *Engine) Stream(ctx sdk.Context, model, piContext, options map[string]any) (*sdk.ModelEventStream, error) {
+	e.mu.Lock()
+	override := e.override
+	e.mu.Unlock()
+	return e.StreamWithOverride(ctx, model, piContext, options, override)
+}
+
+// StreamWithOverride captures controls for this request, never a shared mutable
+// override another session can replace while a queued pump is starting.
+func (e *Engine) StreamWithOverride(ctx sdk.Context, model, piContext, options map[string]any, override ModelOverride) (*sdk.ModelEventStream, error) {
+	override = OverrideForOptions(override, options)
 	stream := sdk.CreateAssistantMessageEventStream()
-	go e.pump(ctx, stream, model, piContext, options)
+	requestDone := ctx.Done()
+	if os.Getenv("PI_CURSOR_GO_DEBUG") == "1" {
+		e.cfg.Logger.Debug("cursor request capture", "closed", channelClosed(requestDone), "sdk_error", ctx.Err() != nil)
+	}
+	go e.pump(ctx, stream, model, piContext, options, override, requestDone)
 	return stream, nil
 }
 
-func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piContext, options map[string]any) {
+func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piContext, options map[string]any, override ModelOverride, requestDone <-chan struct{}) {
 	debugStream := os.Getenv("PI_CURSOR_GO_DEBUG") == "1"
 	if debugStream {
 		e.cfg.Logger.Debug("streamSimple args", "optionsKeys", sortedKeys(options), "contextKeys", sortedKeys(piContext), "modelKeys", sortedKeys(model))
@@ -546,6 +552,11 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 
 	key := e.sessionKey(ctx, entry)
 	e.mu.Lock()
+	if e.stopped {
+		e.mu.Unlock()
+		endCancelled(stream, newPartial(model, entry))
+		return
+	}
 	sess := e.sessions[key]
 	if sess == nil {
 		sess = &Session{Key: key, modelID: entry.ID}
@@ -563,6 +574,20 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 		}
 	}
 	e.mu.Unlock()
+
+	generation := sess.generation()
+	sess.turnMu.Lock()
+	defer sess.turnMu.Unlock()
+	_, endTurn, accepted := sess.beginTurn(goCtx(ctx), generation)
+	if !accepted {
+		p := newPartial(model, entry)
+		p.setStop("aborted", nil)
+		stream.End(snapshotMap(p.msg))
+		return
+	}
+	defer endTurn()
+	sess.turnOverride = override
+	sess.requestDone = requestDone
 
 	// A turn that carries results for our parked host tool calls is a
 	// continuation: resolve them and keep streaming the same run. Nothing new
@@ -609,8 +634,7 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 // a clean agent and replays the transcript.
 func (e *Engine) resetSession(ctx sdk.Context, sess *Session) {
 	e.mu.Lock()
-	agent := sess.agent
-	sess.agent = nil
+	agent := sess.agentSlot.Swap(nil)
 	sess.AgentID = ""
 	sess.pending = nil
 	sess.sentFingerprints = nil
@@ -628,10 +652,11 @@ func (e *Engine) resetSession(ctx sdk.Context, sess *Session) {
 // and returns the run to keep streaming, or nil when this is not a
 // continuation turn.
 func (e *Engine) resumeParked(ctx sdk.Context, sess *Session, client *cursor.Client, apiKey string, entry *ModelEntry, piCtx PiContext, debug bool) *cursor.Run {
-	if sess.agent == nil {
+	agent := sess.activeAgent()
+	if agent == nil {
 		return nil
 	}
-	run := sess.agent.Active()
+	run := agent.Active()
 	if run == nil {
 		return nil
 	}
@@ -662,7 +687,7 @@ func (e *Engine) resumeParked(ctx sdk.Context, sess *Session, client *cursor.Cli
 			// waiting for the rest on the next turn.
 			continue
 		}
-		run.ResolveHostCall(p.ID, map[string]any{"content": out.Text}, out.IsError, out.Text)
+		run.ResolveHostCall(p.ID, out.Payload(), out.IsError, out.Text)
 		if debug {
 			e.cfg.Logger.Debug("resolved parked host call", "id", p.HostID(), "tool", p.ToolName, "bytes", len(out.Text))
 		}
@@ -678,7 +703,7 @@ func (e *Engine) resumeParked(ctx sdk.Context, sess *Session, client *cursor.Cli
 
 	// The stream ended when the run parked; the durable stream continues it.
 	if run.StreamClosedForPause() {
-		if err := run.Resume(goCtx(ctx)); err != nil {
+		if err := run.Resume(sess.context(ctx)); err != nil {
 			e.cfg.Logger.Error("cursor run resume failed", "err", err)
 		}
 	}
@@ -687,35 +712,33 @@ func (e *Engine) resumeParked(ctx sdk.Context, sess *Session, client *cursor.Cli
 
 // pausedOnHostCall is exported through the cursor package as PausedOnHostCall.
 
-// currentOverride merges the installed model controls with the host's current
-// thinking level.
-func (e *Engine) currentOverride(ctx sdk.Context) ModelOverride {
-	e.mu.Lock()
-	ov := e.override
-	e.mu.Unlock()
-	if thinking := thinkingFromContext(ctx); thinking != "" {
-		ov.Thinking = thinking
-	}
-	return ov
-}
-
 // startTurn decides between an append-only continuation and a replay, then
 // sends the new user turn.
 func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client, apiKey string, entry *ModelEntry, piCtx PiContext, debug bool) (*cursor.Run, error) {
+	if err := sess.context(ctx).Err(); err != nil {
+		return nil, err
+	}
 	tools := piCtx.Tools
 	if e.cfg.DisableHostTools {
 		tools = nil
 	}
 	toolSig := toolSignature(tools)
 
-	ov := e.currentOverride(ctx)
+	ov := sess.turnOverride
+	if ov.Thinking == "" {
+		ov = withContextThinking(ov, thinkingFromContext(ctx))
+	}
+	report := reportControls(entry, ov)
+	if sess.recordControls(report) && ctx.HasUI() {
+		ctx.Notify("Cursor controls: "+strings.Join(report.Warnings, "; "), "warning")
+	}
 	if overrideSignature(entry, ov) != sess.overrideSig {
 		// The model controls changed (thinking level, fast mode): the live
 		// agent's parameter selections no longer match, so start a new one.
-		if sess.agent != nil {
+		if sess.activeAgent() != nil {
 			e.cfg.Logger.Debug("model controls changed; agent will be recreated")
-			_ = sess.agent.Close(goCtx(ctx))
-			sess.agent = nil
+			_ = sess.activeAgent().Close(sess.context(ctx))
+			sess.setAgent(nil)
 			sess.AgentID = ""
 		}
 		sess.overrideSig = overrideSignature(entry, ov)
@@ -726,21 +749,22 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 	// this line is what turns "the other session broke" into a traceable event.
 	agentKind := "live"
 	switch {
-	case sess.agent == nil && sess.AgentID != "":
+	case sess.activeAgent() == nil && sess.AgentID != "":
 		agentKind = "resume"
-	case sess.agent == nil:
+	case sess.activeAgent() == nil:
 		agentKind = "create"
 	}
 	e.cfg.Logger.Debug("agent decision", "key", registryKey(sess.Key)[:8], "kind", agentKind, "agent", sess.AgentID)
 
-	agent := sess.agent
+	agent := sess.activeAgent()
 	if agent != nil && sess.toolSig != toolSig {
 		// SetTools only updates local bookkeeping, not Cursor's registered
 		// schemas. Pending host calls were resumed before startTurn, so this is
 		// the safe boundary to recreate and replay with the actual new tools.
 		e.cfg.Logger.Info("host tool schemas changed; recreating Cursor agent")
-		_ = agent.Close(goCtx(ctx))
-		sess.agent, agent = nil, nil
+		_ = agent.Close(sess.context(ctx))
+		sess.setAgent(nil)
+		agent = nil
 		sess.AgentID = ""
 		e.agents.forget(sess.Key)
 	}
@@ -750,19 +774,24 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		spec := AgentSpecFor(entry, e.cfg, apiKey, tools, ov)
 		var err error
 		if sess.AgentID != "" {
-			agent, err = client.ResumeAgent(goCtx(ctx), sess.AgentID, spec)
+			agent, err = client.ResumeAgent(sess.context(ctx), sess.AgentID, spec)
 			if err != nil {
 				e.cfg.Logger.Info("cursor agent resume failed; starting a fresh agent", "err", err)
 				sess.AgentID = ""
 			}
 		}
 		if agent == nil {
-			agent, err = client.CreateAgent(goCtx(ctx), spec)
+			agent, err = client.CreateAgent(sess.context(ctx), spec)
 			if err != nil {
 				return nil, err
 			}
 		}
-		sess.agent = agent
+		if !sess.publishAgent(agent) {
+			cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = agent.Close(cleanup)
+			cancel()
+			return nil, context.Canceled
+		}
 		sess.toolSig = toolSig
 		sess.AgentID = agent.ID()
 		e.agents.remember(sess.Key, agent.ID())
@@ -773,13 +802,13 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		if debug {
 			e.cfg.Logger.Debug("replaying transcript to a fresh agent", "bytes", len(prompt), "messages", len(piCtx.Messages))
 		}
-		run, err := agent.Send(goCtx(ctx), prompt, images(piCtx.Images()))
+		run, err := agent.Send(sess.context(ctx), prompt, images(piCtx.Images()))
 		if err != nil {
 			// The new agent never received the conversation, so keeping it would make
 			// a retry send only the newest message into an empty agent. Drop it: the
 			// retry replays, which is what a fresh agent needs.
-			_ = agent.Close(goCtx(ctx))
-			sess.agent = nil
+			_ = agent.Close(sess.context(ctx))
+			sess.setAgent(nil)
 			sess.AgentID = ""
 			sess.sentFingerprints = nil
 			e.agents.forget(sess.Key)
@@ -793,16 +822,16 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		// The branch was rewritten (edit, branch switch, compaction): the live
 		// agent's memory no longer matches pig's transcript.
 		e.cfg.Logger.Info("cursor conversation diverged; restarting the agent for this branch")
-		if err := agent.Close(goCtx(ctx)); err != nil && debug {
+		if err := agent.Close(sess.context(ctx)); err != nil && debug {
 			e.cfg.Logger.Debug("close diverged agent", "err", err)
 		}
-		sess.agent = nil
+		sess.setAgent(nil)
 		sess.AgentID = ""
 		e.agents.forget(sess.Key)
 		return e.startTurn(ctx, sess, client, apiKey, entry, piCtx, debug)
 	}
 
-	run, err := agent.Send(goCtx(ctx), cursorTurnPrompt(piCtx, newText, tools, false), images(piCtx.Images()))
+	run, err := agent.Send(sess.context(ctx), cursorTurnPrompt(piCtx, newText, tools, false), images(piCtx.Images()))
 	if err != nil {
 		return nil, err // no automatic resend, and no accepted-prefix advance
 	}
@@ -824,21 +853,29 @@ type turnOutcome struct {
 }
 
 func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) turnOutcome {
+	return e.consumeWithUI(ctx, stream, model, entry, sess, run, debug, tools, ctx.HasUI())
+}
+
+// Keep lifecycle/cancellation handling independent of the optional UI surface.
+func (e *Engine) consumeWithUI(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef, hasUI bool) turnOutcome {
 	em := newTurnEmitter(model, entry)
 	em.sink = func(ev map[string]any) { stream.Push(ev) }
 	em.hostToolSet = toolNameSet(tools)
 
 	// Annotations are streamed inline; the entry renderer is only for old history.
 	defer func() {
-		ctx.ClearStatus("cursor-activity")
-		if e.cfg.LiveTools != nil && ctx.HasUI() {
-			e.cfg.LiveTools(ctx, nil)
+		sess.recordRunStatus(run.Status())
+		if hasUI {
+			ctx.ClearStatus("cursor-activity")
+			if e.cfg.LiveTools != nil {
+				e.cfg.LiveTools(ctx, nil)
+			}
 		}
 	}()
 
 	em.begin()
 
-	turnCtx, cancelTurn := context.WithCancel(goCtx(ctx))
+	turnCtx, cancelTurn := context.WithCancel(sess.context(ctx))
 	defer cancelTurn()
 	// An explicit legacy timeout remains a wall cap. By default, bound silence
 	// rather than cancelling a turn that is still producing useful progress.
@@ -883,14 +920,14 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 			hosted = true
 			continue
 		}
-		if ev.Kind == cursor.EventCursorToolStarted || ev.Kind == cursor.EventCursorToolCompleted {
+		if hasUI && (ev.Kind == cursor.EventCursorToolStarted || ev.Kind == cursor.EventCursorToolCompleted) {
 			live := em.cursorTools.snapshot()
 			if len(live) > 0 {
 				ctx.SetStatus("cursor-activity", cursorToolHint(live[0].Tool, live[0].Summary, 0))
 			} else {
 				ctx.ClearStatus("cursor-activity")
 			}
-			if e.cfg.LiveTools != nil && ctx.HasUI() {
+			if e.cfg.LiveTools != nil {
 				e.cfg.LiveTools(ctx, live)
 			}
 		}
@@ -898,6 +935,21 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 			// Cursor is blocked on our callbacks now: the batch is complete.
 			break
 		}
+	}
+	if debug {
+		status := run.Status()
+		e.cfg.Logger.Debug("cursor cancellation boundary", "captured_closed", channelClosed(sess.requestDone), "sdk_closed", channelClosed(ctx.Done()), "same_context", ctx.Done() == sess.requestDone, "turn_cancelled", turnCtx.Err() != nil, "sdk_error", ctx.Err() != nil, "drain_cancelled", cursor.IsCancellation(run.DrainErr()), "drain_error", run.DrainErr() != nil, "local_finished", status.Finished, "terminal", status.TerminalStatus, "run_known", status.ID != "", "cancel_requested", status.CancelRequested)
+	}
+	// A cancelled read side (even a drained/closed stream) is not evidence the
+	// owned upstream run stopped. Cancellation wins over drain errors and tools.
+	if cancelInterruptedTurn(turnCtx, run) {
+		if debug {
+			status := run.Status()
+			e.cfg.Logger.Debug("cursor cancellation outcome", "confirmed", status.CancelConfirmed, "failed", status.CancelFailed, "terminal", status.TerminalStatus, "run_known", status.ID != "")
+		}
+		em.finish("aborted", run.Terminal())
+		stream.End(snapshotMap(em.p.msg))
+		return turnOutcome{}
 	}
 	if hosted {
 		// This turn is over: pig runs the tools and calls back with the results,
@@ -924,12 +976,6 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	if (timedOut || turnCtx.Err() == context.DeadlineExceeded) && !run.Finished() && !hosted {
 		releaseErr := run.CancelRun("turn activity deadline exceeded")
 		e.failWith(stream, em.p, model, errors.New(watch.timeoutMessage(turnCtx.Err() == context.DeadlineExceeded, releaseErr)))
-		return turnOutcome{}
-	}
-	if turnCtx.Err() == context.Canceled && !hosted && !run.Finished() {
-		_ = run.CancelRun("host cancelled the turn")
-		em.finish("aborted", run.Terminal())
-		stream.End(snapshotMap(em.p.msg))
 		return turnOutcome{}
 	}
 
@@ -981,10 +1027,14 @@ func isStaleAgentError(err error) bool {
 // the same agent can be used again with Cursor's side of the conversation intact.
 // False means the caller has to start a fresh agent and replay instead.
 func (e *Engine) releaseStaleRuns(ctx sdk.Context, sess *Session) bool {
-	if sess == nil || sess.agent == nil {
+	if sess == nil {
 		return false
 	}
-	n, err := sess.agent.ReleaseStaleRuns(goCtx(ctx))
+	agent := sess.activeAgent()
+	if agent == nil {
+		return false
+	}
+	n, err := agent.ReleaseStaleRuns(sess.context(ctx))
 	if err != nil {
 		e.cfg.Logger.Debug("could not release runs left on this cursor agent", "err", err)
 		return false
@@ -1039,15 +1089,8 @@ func fingerprints(piCtx PiContext) []string {
 }
 
 func (e *Engine) sessionKey(ctx sdk.Context, entry *ModelEntry) string {
-	cwd := ctx.Cwd()
-	if cwd == "" {
-		cwd = e.cfg.Workspace
-	}
-	file := ""
-	if f, err := ctx.GetSessionFile(); err == nil && f != nil {
-		file = *f
-	}
-	return conversationKey(file, cwd, entry.BaseID, e.nonce)
+	scope, _ := e.scope(ctx)
+	return scope + entry.BaseID
 }
 
 // conversationKey identifies one conversation for the purpose of reusing a Cursor
@@ -1137,32 +1180,13 @@ func AgentSpecFor(entry *ModelEntry, cfg Config, apiKey string, tools []ToolDef,
 
 // applyOverrides maps pig's controls onto the model's parameter selections.
 func applyOverrides(entry *ModelEntry, ov ModelOverride) []Param {
-	params := entry.Params
-	if ov.HasFast && entry.SupportsFast {
-		value := "false"
-		if ov.Fast {
-			value = "true"
-		}
-		params = replaceParam(params, "fast", value)
-	}
-	if ov.Thinking != "" && entry.ThinkingParamID != "" {
-		if mapped, ok := entry.ThinkingLevels[strings.ToLower(ov.Thinking)]; ok {
-			params = replaceParam(params, entry.ThinkingParamID, mapped)
-		}
-	}
-	return params
+	return resolvedParams(entry, ov)
 }
 
 func overrideSignature(entry *ModelEntry, ov ModelOverride) string {
-	params := applyOverrides(entry, ov)
-	parts := make([]string, 0, len(params))
-	for _, p := range params {
-		parts = append(parts, p.ID+"="+p.Value)
-	}
-	return strings.Join(parts, ",")
+	return canonicalParamSignature(resolvedParams(entry, ov))
 }
 
-// thinkingFromContext reads pig's current thinking level, when the host exposes it.
 func thinkingFromContext(ctx sdk.Context) string {
 	if level, err := ctx.GetThinkingLevel(); err == nil {
 		return level
@@ -1415,6 +1439,12 @@ func usageMap(u *cursor.Usage) map[string]any {
 }
 
 func (e *Engine) fail(stream *sdk.ModelEventStream, model map[string]any, modelID string, err error) {
+	if cursor.IsCancellation(err) {
+		p := newPartial(model, &ModelEntry{ID: modelID})
+		endCancelled(stream, p)
+		return
+	}
+	e.recordFailure(err)
 	e.noteRate(err)
 	e.cfg.Logger.Error("cursor provider request failed", "model", modelID, "err", err)
 	p := newPartial(model, &ModelEntry{ID: modelID})
@@ -1470,6 +1500,11 @@ func (e *Engine) humanError(err error) string {
 }
 
 func (e *Engine) failWith(stream *sdk.ModelEventStream, p *partial, model map[string]any, err error) {
+	if cursor.IsCancellation(err) {
+		endCancelled(stream, p)
+		return
+	}
+	e.recordFailure(err)
 	e.cfg.Logger.Error("cursor run failed", "err", err)
 	p.msg["stopReason"] = "error"
 	p.msg["errorMessage"] = e.humanError(err)

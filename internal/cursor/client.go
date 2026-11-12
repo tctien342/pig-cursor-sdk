@@ -144,7 +144,25 @@ func StateDir() string { return bridge.StateDir() }
 func (c *Client) BinPath() string { return c.bridge.Bin }
 
 // PID reports the bridge process id.
-func (c *Client) PID() int { return c.bridge.Ready.PID }
+func (c *Client) PID() int {
+	if c == nil || c.bridge == nil {
+		return 0
+	}
+	return c.bridge.Ready.PID
+}
+
+// CachedProtocol never performs a request or reads credentials.
+func (c *Client) CachedProtocol() string {
+	if c == nil {
+		return "unknown"
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.version == nil {
+		return "unknown"
+	}
+	return c.version.GetProtocolVersion()
+}
 
 // Version returns the cached GetVersion response.
 func (c *Client) Version(ctx context.Context) (*sdkpb.GetVersionResponse, error) {
@@ -358,8 +376,12 @@ func (c *Client) Close() {
 	if c == nil {
 		return
 	}
-	c.bridge.Close()
-	c.callbacks.close()
+	if c.bridge != nil {
+		c.bridge.Close()
+	}
+	if c.callbacks != nil {
+		c.callbacks.close()
+	}
 }
 
 // ---- custom tool callbacks -------------------------------------------------

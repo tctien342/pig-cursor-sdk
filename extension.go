@@ -69,6 +69,8 @@ type state struct {
 func Extension() *sdk.Extension {
 	e := sdk.New("pig-cursor-sdk")
 	st := &state{mode: "agent", fast: map[string]bool{}}
+	st.registerModelControls(e)
+	st.registerDoctor(e)
 
 	// Register at load time from the on-disk or embedded catalog so
 	// `pig --list-models cursor` works without a bridge or the network.
@@ -130,9 +132,24 @@ func Extension() *sdk.Extension {
 		st.mu.Lock()
 		eng := st.engine
 		st.mu.Unlock()
-		if eng != nil && eng.AbortLiveRuns() {
-			ctx.Notify("Live Cursor run released. Work the host already completed was not undone.", "info")
-		} else {
+		if isCursorModel(ctx) {
+			ctx.Abort()
+		} // host cancellation stops current pig tools too
+		if eng == nil {
+			ctx.Notify("No live Cursor run in this session.", "info")
+			return nil
+		}
+		report := eng.AbortSession(ctx)
+		switch {
+		case !report.ScopeKnown:
+			ctx.Notify("The host was asked to stop its current turn; Cursor scope could not be identified safely. No other session was touched.", "warning")
+		case report.Unconfirmed > 0:
+			ctx.Notify("Local Cursor waiting stopped, but upstream cancellation was not confirmed. Run /cursor-abort again to retry. Completed host work was not undone.", "warning")
+		case report.Acknowledged > 0:
+			ctx.Notify("Cursor acknowledged cancellation for this session. Completed host work was not undone.", "info")
+		case report.Stopped > 0:
+			ctx.Notify("Local waiting stopped; this session's Cursor run had already finished.", "info")
+		default:
 			ctx.Notify("No live Cursor run in this session.", "info")
 		}
 		return nil
@@ -181,7 +198,15 @@ func Extension() *sdk.Extension {
 	// Account totals cost a fan-out over agents, so the refresh runs on the
 	// background worker, at most every PI_CURSOR_ACCOUNT_TTL_S (3 min default).
 	e.OnEvent("turn_end", func(ctx sdk.Context, _ map[string]any) (any, error) {
+		st.clearCursorActivity(ctx)
 		st.deferUsageWork(ctx, "turn_end")
+		return nil, nil
+	})
+
+	// Provider-request contexts are cancelled by Escape. Their UI cleanup calls
+	// are rejected; agent_end supplies a fresh, ordered lifecycle context.
+	e.OnEvent("agent_end", func(ctx sdk.Context, _ map[string]any) (any, error) {
+		st.clearCursorActivity(ctx)
 		return nil, nil
 	})
 
@@ -277,11 +302,12 @@ func (s *state) providerConfig(models []map[string]any) sdk.ProviderConfig {
 // configure resolves host environment once per session start.
 func (s *state) configure(ctx sdk.Context) {
 	home, _ := ctx.ConfigHome()
+	workspace := ctx.Cwd()
 	s.mu.Lock()
 	s.toolTheme = ctx.UITheme
 	s.cfg = provider.Config{
 		Provider:       providerID,
-		Workspace:      ctx.Cwd(),
+		Workspace:      workspace,
 		ConfigHome:     home,
 		BridgeBin:      strings.TrimSpace(os.Getenv("CURSOR_SDK_BRIDGE_BIN")),
 		SettingSources: settingSourcesFromEnv(),
@@ -322,12 +348,20 @@ func settingSourcesFromEnv() []string {
 // (registration inspection, RPC-only hosts).
 func (s *state) engineFor(ctx sdk.Context) *provider.Engine {
 	s.mu.Lock()
+	engine := s.engine
+	s.mu.Unlock()
+	if engine != nil {
+		return engine
+	}
+	// Host getters must not run under state.mu: footer/UI callbacks may need it.
+	home, _ := ctx.ConfigHome()
+	workspace := ctx.Cwd()
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.engine == nil {
-		home, _ := ctx.ConfigHome()
 		s.cfg = provider.Config{
 			Provider:   providerID,
-			Workspace:  ctx.Cwd(),
+			Workspace:  workspace,
 			ConfigHome: home,
 			Logger:     newLogger(),
 			Mode:       s.mode,
@@ -352,16 +386,9 @@ func (s *state) stream(ctx sdk.Context, model, piContext, options map[string]any
 	s.mu.Lock()
 	s.toolTheme = ctx.UITheme
 	s.mu.Unlock()
-	modelID := stringOf(model, "id")
-	s.mu.Lock()
 	ov := provider.ModelOverride{Thinking: thinkingLevel(ctx, options)}
-	if v, ok := s.fast[modelID]; ok {
-		ov.Fast, ov.HasFast = v, true
-	}
-	s.mu.Unlock()
-	eng.SetModelOverride(ov)
 	s.refreshStatus(ctx)
-	return eng.Stream(ctx, model, piContext, options)
+	return eng.StreamWithOverride(ctx, model, piContext, options, ov)
 }
 
 func thinkingLevel(ctx sdk.Context, options map[string]any) string {
@@ -797,6 +824,19 @@ func limitWindow(eng *provider.Engine) string {
 // ---- live Cursor-side tool cards -------------------------------------------
 
 const toolsWidgetKey = "cursor-tools"
+
+func (s *state) clearCursorActivity(ctx sdk.Context) {
+	s.mu.Lock()
+	live, source := len(s.liveTools) > 0, s.liveCtx
+	s.mu.Unlock()
+	// A late lifecycle event must not erase a newer, still-active request's
+	// hint. A cancelled source or a provider's cleared snapshot is safe to reap.
+	if live && source != nil && source.Err() == nil {
+		return
+	}
+	ctx.ClearStatus("cursor-activity")
+	s.pushLiveTools(ctx, nil)
+}
 
 // pushLiveTools shows one currently running call above the editor. History is
 // already inline in the assistant message, never collected near the usage bar.

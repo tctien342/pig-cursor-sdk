@@ -154,6 +154,9 @@ func sameCallback(previous *ParkedCall, req ToolCallRequest) bool {
 }
 
 func (r *Run) queueEvent(ev Event) bool {
+	if r.ctx.Err() != nil {
+		return true
+	}
 	if r.suppressed(ev.Kind) {
 		return true
 	}
@@ -168,7 +171,7 @@ func (r *Run) queueEvent(ev Event) bool {
 	if !emit {
 		return true
 	}
-	if !r.queue.push(RunEvent{Event: ev}) {
+	if !r.queueRef().push(RunEvent{Event: ev}) {
 		r.overflow()
 		return false
 	}

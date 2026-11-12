@@ -190,6 +190,9 @@ func (a *Agent) Send(ctx context.Context, text string, images []Image) (*Run, er
 		return nil, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	msg := &sdkpb.UserMessage{Text: validText(text)}
 	for _, img := range images {
 		msg.Images = append(msg.Images, &sdkpb.SdkImage{
@@ -202,6 +205,7 @@ func (a *Agent) Send(ctx context.Context, text string, images []Image) (*Run, er
 	// live stream so the provider turn can finish, while runCtx keeps the run
 	// itself alive for the durable resume.
 	streamCtx, cancelStream := context.WithCancel(runCtx)
+	stopStartupCancel := context.AfterFunc(ctx, cancelStream)
 	stream, err := a.client.Agent.Send(streamCtx, connect.NewRequest(&sdkpb.SendRequest{
 		AgentId: a.id,
 		Message: msg,
@@ -213,6 +217,7 @@ func (a *Agent) Send(ctx context.Context, text string, images []Image) (*Run, er
 			EnableSteps:  true,
 		},
 	}))
+	stopStartupCancel()
 	if err != nil {
 		cancelStream()
 		cancel()
@@ -264,14 +269,20 @@ func (a *Agent) Close(ctx context.Context) error {
 	a.closed = true
 	a.mu.Unlock()
 	if closed {
+		if run != nil {
+			status := run.Status()
+			if status.CancelRequested && !status.CancelConfirmed && status.TerminalStatus == "" {
+				return run.CancelRunContext(ctx, "cursor: agent closed")
+			}
+		}
 		return nil
 	}
-	if run != nil {
-		run.abandon(errors.New("cursor: agent closed"))
-	}
 	var err error
+	if run != nil && run.Status().TerminalStatus == "" {
+		err = run.CancelRunContext(ctx, "cursor: agent closed")
+	}
 	if _, cerr := a.client.Agent.CloseAgent(ctx, connect.NewRequest(&sdkpb.CloseAgentRequest{AgentId: a.id})); cerr != nil {
-		err = wrapErr("CloseAgent", cerr)
+		err = errors.Join(err, wrapErr("CloseAgent", cerr))
 	}
 	a.unroute()
 	return err
@@ -358,14 +369,17 @@ type Run struct {
 
 	queue *eventQueue
 
-	mu       sync.Mutex
-	runID    string
-	agentID  string
-	parked   map[string]*ParkedCall
-	order    []string
-	terminal *RunResult
-	fin      bool
-	drainErr error
+	mu                               sync.Mutex
+	runID                            string
+	agentID                          string
+	parked                           map[string]*ParkedCall
+	order                            []string
+	terminal                         *RunResult
+	fin                              bool
+	drainErr                         error
+	cancelMu                         sync.Mutex
+	cancelRequested, cancelConfirmed bool
+	cancelError                      error
 
 	// emitted holds the host tool call ids already surfaced to the host, so a
 	// durable replay cannot render the same tool card twice.
@@ -433,7 +447,7 @@ func (r *Run) PauseStream() {
 	if cancel != nil {
 		cancel()
 	}
-	r.queue.close()
+	r.queueRef().close()
 }
 
 // PausedOnHostCall reports whether the live stream stopped because the run is
@@ -561,10 +575,16 @@ func (r *Run) Resume(ctx context.Context) error {
 	r.resumed = true
 	r.recovering = false
 	r.paused = false
-	r.queue = newEventQueue(maxQueuedEvents)
+	r.queue.reopen() // retain late batched callbacks queued after the pause
 	r.mu.Unlock()
 	if rid == "" {
-		return errors.New("cursor: run id is not known yet")
+		err := errors.New("cursor: run id is not known yet")
+		r.mu.Lock()
+		r.drainErr = err
+		queue := r.queue
+		r.mu.Unlock()
+		queue.close()
+		return err
 	}
 
 	req := &sdkpb.ObserveRunRequest{RunId: rid}
@@ -572,10 +592,18 @@ func (r *Run) Resume(ctx context.Context) error {
 		req.AfterOffset = &off
 	}
 	streamCtx, cancelStream := context.WithCancel(r.ctx)
+	stopStartupCancel := context.AfterFunc(ctx, cancelStream)
 	stream, err := r.agent.client.Agent.ObserveRun(streamCtx, connect.NewRequest(req))
+	stopStartupCancel()
 	if err != nil {
 		cancelStream()
-		return wrapErr("ObserveRun", err)
+		err = wrapErr("ObserveRun", err)
+		r.mu.Lock()
+		r.drainErr = err
+		queue := r.queue
+		r.mu.Unlock()
+		queue.close()
+		return err
 	}
 	r.mu.Lock()
 	if r.cancelStream != nil {
@@ -597,7 +625,7 @@ func (r *Run) RunID() string {
 // Next returns the next event a provider turn should consume, blocking until
 // one arrives, the run ends, or ctx is done.
 func (r *Run) Next(ctx context.Context) (RunEvent, bool) {
-	return r.queue.pop(ctx, r.ctx)
+	return r.queueRef().pop(ctx, r.ctx)
 }
 
 // NextWithin waits up to wait for the next event. ok=false means either the
@@ -606,11 +634,11 @@ func (r *Run) Next(ctx context.Context) (RunEvent, bool) {
 func (r *Run) NextWithin(ctx context.Context, wait time.Duration) (RunEvent, bool) {
 	tctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
-	return r.queue.pop(tctx, r.ctx)
+	return r.queueRef().pop(tctx, r.ctx)
 }
 
 // NextReady returns the next event without blocking.
-func (r *Run) NextReady() (RunEvent, bool) { return r.queue.popReady() }
+func (r *Run) NextReady() (RunEvent, bool) { return r.queueRef().popReady() }
 
 // PendingHostCalls lists host tool calls still waiting for their result, in
 // arrival order. A provider turn resolves these from the host tool results the
@@ -644,11 +672,8 @@ func (r *Run) ResolveHostCall(id string, payload map[string]any, isError bool, n
 		return false
 	}
 	p.resolved = true
-	if isError {
-		p.err = errors.New(orString(note, "host tool failed"))
-	} else {
-		p.result = wrapToolResult(orString(payloadText(payload), note))
-	}
+	// Ordinary tool failures are results with isError, not callback RPC failures.
+	p.result = hostToolResult(payload, isError, note)
 	p.mu.Unlock()
 	close(p.done)
 	delete(r.parked, id)
@@ -674,15 +699,7 @@ func (r *Run) ResolveHostCall(id string, payload map[string]any, isError bool, n
 // turn that requested the abort must not undo work the host already did; this
 // only stops Cursor from going further.
 func (r *Run) CancelRun(reason string) error {
-	runID := r.RunID()
-	r.abandon(errors.New(orString(reason, "cancelled")))
-	if runID == "" {
-		return errors.New("cursor: local run stopped, but upstream cancellation is unavailable without a run ID")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, err := r.agent.client.Agent.CancelRun(ctx, connect.NewRequest(&sdkpb.CancelRunRequest{RunId: runID}))
-	return wrapErr("CancelRun", err)
+	return r.CancelRunContext(context.Background(), reason)
 }
 
 // abandon releases every parked call and stops the stream.
@@ -704,7 +721,7 @@ func (r *Run) abandon(reason error) {
 	r.fin = true
 	r.mu.Unlock()
 	r.c()
-	r.queue.close()
+	r.queueRef().close()
 }
 
 // Finished reports whether the run reached a terminal state or was released.
@@ -774,13 +791,25 @@ func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, er
 	// tool the host advertised and the arguments Cursor chose. The stream's own
 	// tool_call event for the same call is bookkeeping only, so exactly one card
 	// reaches the host.
-	r.queue.push(RunEvent{
+	event := RunEvent{
 		Event: Event{
 			Kind:     EventToolCallStarted,
 			ToolCall: &ToolCallEvent{ID: raw, DisplayID: id, ToolName: req.ToolName, Args: req.Args, Status: "running"},
 		},
 		Pending: p,
-	})
+	}
+	r.mu.Lock()
+	if r.fin {
+		r.mu.Unlock()
+		r.settleAbandoned(p, raw, errors.New("cursor: run cancelled before callback delivery"))
+		return r.copyResult(p)
+	}
+	queued := r.queue.pushCallback(event)
+	r.mu.Unlock()
+	if !queued {
+		r.overflow()
+		return r.copyResult(p)
+	}
 	if r.agent != nil && r.agent.client != nil && r.agent.client.log != nil {
 		// INFO, not debug: "did the host run this tool once or twice?" is a
 		// question worth answering from the default log.
@@ -803,24 +832,25 @@ func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, er
 	case <-timer.C:
 		r.settleAbandoned(p, id, fmt.Errorf("cursor: host tool %s did not return within %s", req.ToolName, defaultParkTimeout))
 	}
-	if p.err != nil {
-		return nil, p.err
-	}
 	return r.copyResult(p)
 }
 
 // settleAbandoned ends a parked call from the run's side (cancel/timeout).
 func (r *Run) settleAbandoned(p *ParkedCall, id string, reason error) {
 	p.mu.Lock()
-	if !p.resolved {
+	changed := !p.resolved
+	if changed {
 		p.resolved = true
 		p.err = reason
 		close(p.done)
-		r.mu.Lock()
-		delete(r.parked, id)
-		r.mu.Unlock()
 	}
 	p.mu.Unlock()
+	// Never hold p.mu while taking r.mu: Resolve/abandon use the other order.
+	if changed {
+		r.mu.Lock()
+		delete(r.parked, p.ID)
+		r.mu.Unlock()
+	}
 }
 
 func (r *Run) copyResult(p *ParkedCall) (map[string]any, error) {
@@ -917,9 +947,11 @@ func (r *Run) drain(stream *connect.ServerStreamForClient[sdkpb.RunStreamMessage
 				}
 				if ev.Kind == EventResult || ev.Kind == EventDone {
 					r.mu.Lock()
-					r.fin = true
+					if ev.Kind == EventResult || !r.paused {
+						r.fin = true
+					}
 					r.mu.Unlock()
-					r.queue.close()
+					r.queueRef().close()
 					return // terminal is final: no reconnect or late output
 				}
 			}
@@ -930,9 +962,12 @@ func (r *Run) drain(stream *connect.ServerStreamForClient[sdkpb.RunStreamMessage
 			stream = next
 			continue
 		}
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil {
 			r.mu.Lock()
-			if r.terminal == nil {
+			// An independently cancelled observer is not a completed upstream
+			// run. Preserve it unless our own pause/abandon deliberately stopped it.
+			localStop := IsCancellation(err) && (r.paused || r.ctx.Err() != nil)
+			if r.terminal == nil && !localStop {
 				r.drainErr = wrapErr("run stream", err)
 			}
 			r.mu.Unlock()
@@ -946,7 +981,7 @@ func (r *Run) drain(stream *connect.ServerStreamForClient[sdkpb.RunStreamMessage
 			r.fin = true
 		}
 		r.mu.Unlock()
-		r.queue.close()
+		r.queueRef().close()
 		return
 	}
 }
@@ -1013,29 +1048,24 @@ func (q *eventQueue) push(ev RunEvent) bool {
 }
 
 func (q *eventQueue) pop(ctx context.Context, runCtx context.Context) (RunEvent, bool) {
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			q.cond.Broadcast()
-		case <-runCtx.Done():
-			q.cond.Broadcast()
-		case <-stop:
-		}
-	}()
+	wake := func() { q.mu.Lock(); q.cond.Broadcast(); q.mu.Unlock() }
+	stopWait := context.AfterFunc(ctx, wake)
+	defer stopWait()
+	stopRun := context.AfterFunc(runCtx, wake)
+	defer stopRun()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for {
+		if ctx.Err() != nil || runCtx.Err() != nil {
+			return RunEvent{}, false
+		}
 		if len(q.items) > 0 {
 			ev := q.items[0]
+			q.items[0] = RunEvent{}
 			q.items = q.items[1:]
 			return ev, true
 		}
 		if q.closed {
-			return RunEvent{}, false
-		}
-		if ctx.Err() != nil || runCtx.Err() != nil {
 			return RunEvent{}, false
 		}
 		q.cond.Wait()
@@ -1049,9 +1079,23 @@ func (q *eventQueue) popReady() (RunEvent, bool) {
 		return RunEvent{}, false
 	}
 	ev := q.items[0]
+	q.items[0] = RunEvent{}
 	q.items = q.items[1:]
 	return ev, true
 }
+
+func (q *eventQueue) pushCallback(ev RunEvent) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.items) >= q.maxEvents {
+		return false
+	}
+	q.items = append(q.items, ev)
+	q.cond.Signal()
+	return true
+}
+
+func (q *eventQueue) reopen() { q.mu.Lock(); q.closed = false; q.cond.Broadcast(); q.mu.Unlock() }
 
 func (q *eventQueue) close() {
 	q.mu.Lock()
@@ -1070,7 +1114,7 @@ func (q *eventQueue) len() int {
 func (r *Run) queuedIDs() []string {
 	var out []string
 	for {
-		ev, ok := r.queue.popReady()
+		ev, ok := r.queueRef().popReady()
 		if !ok {
 			break
 		}
@@ -1080,10 +1124,6 @@ func (r *Run) queuedIDs() []string {
 }
 
 // ---- helpers --------------------------------------------------------------
-
-func wrapToolResult(text string) map[string]any {
-	return map[string]any{"content": text}
-}
 
 func payloadText(m map[string]any) string {
 	if m == nil {
@@ -1095,7 +1135,26 @@ func payloadText(m map[string]any) string {
 	if s, ok := m["text"].(string); ok {
 		return s
 	}
-	return ""
+	var texts []string
+	switch blocks := m["content"].(type) {
+	case []any:
+		for _, value := range blocks {
+			if block, ok := value.(map[string]any); ok && block["type"] == "text" {
+				if text, ok := block["text"].(string); ok {
+					texts = append(texts, text)
+				}
+			}
+		}
+	case []map[string]any:
+		for _, block := range blocks {
+			if block["type"] == "text" {
+				if text, ok := block["text"].(string); ok {
+					texts = append(texts, text)
+				}
+			}
+		}
+	}
+	return strings.Join(texts, "\n")
 }
 
 func orString(v, fallback string) string {
@@ -1108,7 +1167,7 @@ func orString(v, fallback string) string {
 // structFromToolResult keeps a host result as a Struct with a text field, so
 // the bridge never sees a bare scalar.
 func structFromToolResult(text string) (*structpb.Struct, error) {
-	return structFromMap(map[string]any{"content": text})
+	return structFromMap(hostToolResult(map[string]any{"content": text}, false, ""))
 }
 
 // sortStrings is kept for deterministic callback reporting in logs.

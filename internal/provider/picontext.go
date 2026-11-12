@@ -137,6 +137,7 @@ func parseMessage(m map[string]any) (Message, bool) {
 				msg.Blocks = append(msg.Blocks, Block{
 					Type: "toolResult", ToolID: firstString(bm, "toolCallId", "tool_use_id"),
 					Text: blocksToText(bm["content"]), IsError: boolOrNil(bm["isError"]),
+					Args: map[string]any{"content": bm["content"], "structuredContent": bm["structuredContent"]},
 				})
 			}
 		}
@@ -247,12 +248,12 @@ func (c PiContext) PendingToolResults(want []string) map[string]ToolOutcome {
 			if id == "" || !wanted[id] {
 				continue
 			}
-			out[id] = ToolOutcome{Text: b.Text, IsError: b.IsError}
+			out[id] = ToolOutcome{Text: b.Text, IsError: b.IsError, Content: b.Args["content"], Structured: mapOrNil(b.Args["structuredContent"])}
 		}
 		if m.Role == "toolResult" {
 			id := firstString(m.Raw, "toolCallId")
 			if id != "" && wanted[id] {
-				out[id] = ToolOutcome{Text: blocksToText(m.Raw["content"]), IsError: boolOrNil(m.Raw["isError"])}
+				out[id] = ToolOutcome{Text: blocksToText(m.Raw["content"]), IsError: boolOrNil(m.Raw["isError"]), Content: m.Raw["content"], Structured: mapOrNil(m.Raw["structuredContent"])}
 			}
 		}
 	}
@@ -261,8 +262,22 @@ func (c PiContext) PendingToolResults(want []string) map[string]ToolOutcome {
 
 // ToolOutcome is one host tool result.
 type ToolOutcome struct {
-	Text    string
-	IsError bool
+	Text       string
+	IsError    bool
+	Content    any
+	Structured map[string]any
+}
+
+func (o ToolOutcome) Payload() map[string]any {
+	content := o.Content
+	if content == nil {
+		content = o.Text
+	}
+	payload := map[string]any{"content": content}
+	if o.Structured != nil {
+		payload["structuredContent"] = o.Structured
+	}
+	return payload
 }
 
 // ReplayPrompt renders the transcript for a fresh Cursor agent: a continuity

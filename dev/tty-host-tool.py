@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """One live turn proving an advertised pig bash call remains a native tool call."""
+import argparse
 import importlib.util
 from pathlib import Path
 import tempfile
@@ -10,9 +11,15 @@ spec.loader.exec_module(mod)
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--error", action="store_true", help="Verify an ordinary native tool failure")
+    args = parser.parse_args()
+    marker = "pig-native-error-proof" if args.error else "pig-native-proof"
     with tempfile.TemporaryDirectory(prefix="cursor-host-tool-") as folder:
-        prompt = "Use the advertised pig bash custom tool, not Cursor's own shell, to run `printf pig-native-proof`. Then briefly report its output."
-        terminal = mod.Terminal(["--session-dir", folder, "--model", "cursor/grok-4.7", "--thinking", "low", "--tools", "bash", prompt])
+        prompt = ("Use the advertised pig bash custom tool exactly once, not Cursor's own shell, "
+                  "to run `printf pig-native-error-proof; exit 7`. Briefly acknowledge the failure; do not retry.") if args.error else (
+                  "Use the advertised pig bash custom tool, not Cursor's own shell, to run `printf pig-native-proof`. Then briefly report its output.")
+        terminal = mod.Terminal(["--session-dir", folder, "--model", "cursor/grok-4.7", "--thinking", "low", "--tools", "bash", prompt], agent_dir=Path(folder) / "agent")
         try:
             def done():
                 _, rows = mod.entries(folder)
@@ -25,10 +32,10 @@ def main():
             results = [row["message"] for row in rows if row.get("message", {}).get("role") == "toolResult"]
             assert len(calls) == 1 and calls[0]["name"] == "bash", calls
             assert calls[0]["id"] == results[0]["toolCallId"], "native result did not match call"
-            assert any("pig-native-proof" in str(r.get("content")) and not r.get("isError") for r in results), results
-            assert not any(block.get("textSignature") == mod.SIGNATURE and "pig-native-proof" in block.get("text", "")
+            assert any(marker in str(r.get("content")) and bool(r.get("isError")) == args.error for r in results), results
+            assert not any(block.get("textSignature") == mod.SIGNATURE and marker in block.get("text", "")
                            for row in rows for block in row.get("message", {}).get("content", []) if isinstance(block, dict)), "pig call was converted to internal annotation"
-            print("PASS: one real pig bash toolCall + matching successful toolResult; no internal-tool conversion")
+            print("PASS: one real pig bash toolCall + matching " + ("error" if args.error else "successful") + " toolResult; normal assistant completion; no internal-tool conversion")
         finally:
             terminal.stop()
 

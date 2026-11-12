@@ -1,0 +1,91 @@
+Native Cursor model enhancements — 2026-11-12–13 (local time)
+
+Continuity: committed in 707b2c0. continuity_test.go covers image-only append,
+full text/image tails beyond 4096 bytes, complete arguments/error fingerprints,
+branches and assistant-only suffixes. Send bookkeeping advances after success.
+
+Local verification (actual child exit_code=0, not wrapper status):
+  go test . ./internal/cursor ./internal/provider
+  go test -race ./internal/cursor ./internal/provider -run 'Test(BridgeStartup|Cancellation|QueueCancellation|CancelledWait|LateBatched|AbortScope|AbortGeneration|HostResultReplay|HostToolResultEnvelope|OrdinaryToolFailure|Doctor|ExplicitControls|AgentSpecUses|ImageOnly|Continuity)' -count=1
+  go vet ./internal/cursor ./internal/provider
+  go build .
+  pig install . --validate-only --json
+Validation JSON: valid=true; cursor-abort, cursor-fast and cursor-doctor registered.
+An outgoing AgentSpec assertion initially caught a missed controls-wrapper
+integration; the wrapper now uses resolvedParams/canonical effective signatures.
+
+Deterministic coverage:
+- separate same-cwd sessions, abort generation and replacement publication;
+- cancellation RPC failure/retry/idempotency/deadline and released local waiters;
+- queue cancellation wakeup and late batched callbacks across a closed pause;
+- shared initialization, independently cancelled waiter, Stop during startup,
+  late successful startup disposed exactly once outside e.mu, explicit retry;
+- actual AgentSpec off/effort parameters, aliases/default context and fast windows;
+- text/image/isError/structuredContent callback envelopes and ordinary error replay;
+- native result/expansion data not mutated or unnecessarily forwarded;
+- passive doctor, no client creation or passive ping, explicit existing-client ping,
+  bounded history and omission of credentials/raw errors/private paths/run IDs.
+
+Live native tool failure: PASS
+  dev/.venv/bin/python dev/tty-host-tool.py --error
+  One actual pig bash toolCall and matching isError toolResult, ordinary assistant
+  completion, no conversion to Cursor-internal activity.
+
+CLI/cancellation regression discovery:
+- Initial offline doctor proved no bridge and zero active tools. Its fast-mode
+  assertion incorrectly required a change when slow mode was already selected.
+  Fixture now starts on explicit :fast and isolates host agent settings.
+- Initial Escape stopped the host request but left a running hint: cleanup through
+  the cancelled provider context was rejected. Fresh turn_end/agent_end contexts
+  now remove the widget/status. Cleanup also refuses to erase a still-active
+  newer hint (focused root race regression).
+- The first isolated fixture omitted host auth.json admission, preventing model
+  selection/model startup before extension execution. The fixture now creates a
+  minimal Cursor-only temporary auth file with 0600 permissions (directory 0700),
+  removed with its temporary directory. Offline doctor/fast checks now PASS:
+  no bridge, zero tools, registered :fast -> :slow selection with fast=false,
+  existing-bridge probe skipped, and no user/assistant messages were created.
+- Inspection identified two cancellation bypasses: drain-error handling preceded
+  caller cancellation, and stream Done without a terminal result could suppress
+  cancellation. These are now independently covered, as is missing run identity.
+- Actual HTTP read cancellation with a live caller, wrapped cancellation and a
+  real terminal-result control now PASS through consume (UI factored out only),
+  with one owned cancellation and no prompt resend. The reader no longer discards
+  independent context.Canceled as if it were successful completion.
+- Instrumented live traces show the real caller cancellation arrives with a
+  known run before local completion; explicit /cursor-abort visibly acknowledges
+  upstream cancellation. The fixture had queried a static doctor snapshot before
+  the bounded RPC completed. Doctor now distinguishes pending/acknowledged/failed
+  cancellation, with real terminal state taking precedence. A held-RPC regression
+  and an attempt-correlated completion barrier precede the final live recheck.
+  Escape now has actual confirmed=true / failed=false RPC completion, a fresh
+  doctor acknowledgment, and a successful next turn returning 42. The initial
+  script's final strict assertion failed because the host/legacy Go SDK stores
+  the interrupted turn as stopReason=error, errorMessage="context canceled".
+  That external limitation is documented, not normalized away; the fixture only
+  permits that exact initial record before the next user message, never a later
+  provider/continuation error.
+- Explicit /cursor-abort completion: PASS (child exit_code=0). Its completed
+  cancellation RPC reports confirmed=true / failed=false; a fresh doctor agrees;
+  the next turn returns 42 with exactly two user requests and no stale-run error.
+  The exact initial host context-canceled record is reported as a LIMIT.
+- Held-RPC doctor regression: PASS before and after releasing the response.
+- Concurrent Stop/init/late-cleanup and still-active UI cleanup guard race checks:
+  PASS. Final affected-package suites, selected races, vet, build and extension
+  validation PASS. Final Escape acceptance: PASS (child exit_code=0), including
+  completed RPC, fresh doctor, successful next turn and no duplicate user request.
+  The sole initial host context-canceled record remains an explicit LIMIT.
+- Fresh final-source extension registration audit: PASS (child exit_code=0), with
+  valid=true, cursor-abort/cursor-fast/cursor-doctor and agent_end registered.
+- The transcript exception has offline adversarial checks rejecting continuation,
+  other-provider, unrelated-message, other-role and extra-assistant errors.
+- Advisory reviews addressed cancellation causality, single-flight initialization,
+  pending RPC diagnostics and artifact/fixture evidence. Patch disclosure settings
+  withheld source from the Advisor; this is not an independent full-code review.
+
+Limits: cancellation acknowledgment does not undo completed tools or prove OS
+child teardown. Current-turn inline images and explicit structuredContent are
+supported; arbitrary native expansion metadata remains in pig. Fresh-process
+continuity remains conservative. Host settings/session files in new fixtures are
+isolated, but the installed bridge executable and authorized remote account are
+shared intentionally. No unrelated whole-repository suite was run.
