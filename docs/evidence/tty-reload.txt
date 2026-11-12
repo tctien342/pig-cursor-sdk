@@ -1,0 +1,27 @@
+pig-cursor-sdk: chat and /reload in a real PTY, captured by dev/tty-reload-check.py
+(2026-11-12, pig 0.7.0+1.5.0, 110x40, Cursor Desktop plan read live)
+
+Before the fix this run never printed a line: the extension never answered
+turn_start, so pig sat in subprocess.Conn.request forever.
+
+extension up after 2.0s
+first turn completed after 9.9s
+first answer on screen
+reload finished after 2.6s
+post-reload turn completed after 10.4s
+post-reload answer on screen
+capture: 133064 bytes in /tmp/pi-reload-raw.log
+--- final screen ---
+ The user wants me to reply with exactly "first-turn-ok".
+ first-turn-ok
+ Reloaded keybindings, extensions, skills, prompts, themes, and context files
+ Reply with exactly: after-reload-ok
+ The user wants me to reply with exactly "after-reload-ok".
+ after-reload-ok
+ cursor ▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 7.1% · included used · $55.77 bonus · resets 30 Nov
+── ⠧ Working ─────────────────────────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/Sources/Lab/pig-cursor-sdk (main)
+↑28k ↓74 R17k CH49.5% 5.5%/256k (auto)                                    (cursor) grok-4.7@500k:slow • medium
+cursor · grok-4.7@500k:slow · pid 18433 · 14k tok
+--- PASS: chat, /reload, and a turn after reload all completed ---

@@ -228,7 +228,7 @@ proto/, gen/               sdk.v1 protos (vendored) and their generated Go
 docs/display-rules.md      the display contract, enforced by tests
 internal/provider/bar.go   the plan bar: fill, animation cap, width fitting
 docs/evidence/             audit, live event capture, terminal capture, bridge resume log
-dev/                       live/multi-turn/PTY/plan runners, probes, benchmark — its own Go module
+dev/                       live/multi-turn/PTY/reload/plan runners, probes, benchmark — its own Go module
 scripts/gen-fallback-catalog.py  refresh the embedded offline catalog snapshot
 ```
 
@@ -244,14 +244,22 @@ is everyone else's extension failing to start.
 ## Verification
 
 ```bash
-go test ./...                     # 22 tests: coordinator, decoder against real frames, display rules
+go test ./...                     # 45 tests: coordinator, decoder against real frames, display rules, state locking
 pig install . --validate-only --json
 ./dev/run-live.sh cursor/grok-4.7 "Use the bash tool to run exactly: echo hello-go. Then tell me what it printed."
+dev/.venv/bin/python dev/tty-reload-check.py   # chat, /reload, and a turn after reload — fails on a hang
+./dev/bar-screen.sh               # the bar, read back from a terminal emulator's screen
 python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty-session.txt
 ./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
-cd dev && cd dev && go run ./cmd/planprobe  # plan numbers + timings, without starting pig
+cd dev && go run ./cmd/planprobe  # plan numbers + timings, without starting pig
 ```
+
+`tty-reload-check.py` exists because this extension's failure mode was silence: the
+host waits on a handler forever, so a "did it work" check cannot be a sleep and a
+grep. It waits on the extension's own log and on text in an emulated screen, and it
+prints the final screen and a PASS/FAIL line. The evidence from the run that fixed
+the hang is in [docs/evidence/tty-reload.txt](docs/evidence/tty-reload.txt).
 
 ## Known limitations
 
@@ -275,15 +283,53 @@ cd dev && cd dev && go run ./cmd/planprobe  # plan numbers + timings, without st
 - Cursor's own account usage/quota is not exposed by `sdk.v1`, so there is no
   quota readout to show.
 
-## Handler rule: never call back into pig from an event handler
+## The hang: one mutex, taken twice
 
-`session_start` (and every other handler) runs while pig is waiting for its result.
-A handler that sends a request *back* to pig — `SetWidgetRenderer`, `SetStatus`, or
-anything that reaches the network before answering — is waiting on a host that is
-waiting on it. The handler never returns, so the provider is never registered: the
-`/cursor*` commands disappear, `cursor/*` models stop resolving, and chat fails with
-"model not found", with no error anywhere except one line in the extension's stderr
-log: `extension handlers did not stop before the shutdown deadline`.
+pig froze on every chat and on `/reload` with this extension loaded. Nothing was
+logged, nothing errored, and the model stayed selectable; the process just stopped
+answering. Two goroutine dumps (`kill -QUIT`) named it exactly:
 
-Plan reads (which call Cursor) and every widget push therefore run on a single
-deferred worker (`state.deferPlanWork`), not inside the handler.
+```
+goroutine 102  turn_start handler
+  syncPlanBar          extension.go:776   [sync.Mutex.Lock]     <- wants state.mu
+goroutine  53  deferred worker
+  setPlanPct           extension.go:950   [sync.Mutex.Lock]     <- wants state.mu
+```
+
+`syncPlanBar` took `state.mu` and then called `barShown()` and `engineRef()`, which
+take `state.mu` themselves. Go's `sync.Mutex` is not reentrant, so the handler never
+returned. pig was blocked in `subprocess.Conn.request` waiting for the handler's
+result, the extension never answered another request, and every later turn and
+`/reload` queued behind it. `loadCatalogLocked` had the same shape (it called the
+locking `configHomeSDK`), hidden only because `session_start` fills `ConfigHome`
+first.
+
+Rules that came out of it, both enforced by tests in `state_lock_test.go`:
+
+1. **Never take `state.mu` twice on one path.** A helper that assumes the caller
+   holds the lock is named `...Locked` and takes no lock of its own; everything else
+   locks. `TestPlanBarStateReadsDoNotSelfLock` and
+   `TestLoadCatalogLockedResolvesHomeWithoutRelocking` run the state readers under a
+   watchdog, because a self-deadlock never returns and never errors.
+2. **Never hold `state.mu` across a host call.** A host call made from inside a
+   handler did work on the host this was measured against (pig 0.7.0+1.5.0): the
+   SDK reports `blocked/host_call` and pig serves the call. That is observed
+   behaviour, not an SDK guarantee, so nothing here relies on it — but a mutex
+   held across a host call turns any slow host into a wedged extension, and that
+   failure mode has no error message at all.
+
+Network reads still stay off handlers, for a different reason: a plan read or an
+account fan-out inside `session_start`/`turn_end` makes pig wait on Cursor's HTTP
+round trip before it can carry on. Those, and the pushes that show their results,
+run on one single-flight worker (`state.deferUsageWork`), so a burst of turns
+coalesces into one extra pass instead of stacking goroutines. Both background
+goroutines (the worker and the bar's fill-in animation) outlive the handler that
+started them and recover a panic, because a context goes stale when the session is
+replaced and a read through it panics.
+
+A second bug fell out of the same investigation: `ctx.Model()` is the **bare** model
+id (`grok-4.7@500k:slow`), not `cursor/grok-4.7@500k:slow`, so the old
+`strings.HasPrefix(model, "cursor/")` test never matched. The bar and the status
+line were therefore dead even when nothing hung. `isCursorModel` now reads
+`ctx.ModelProvider()` and falls back to the prefix, and the bar is verified on screen
+by `dev/bar-screen.sh` and `dev/tty-reload-check.py`.

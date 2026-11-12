@@ -43,13 +43,19 @@ type state struct {
 
 	// Plan bar widget: a usage bar above the editor, filled in on read.
 	planRender func(int) []string
-	planPhase  int  // cells the bar may reveal; -1 once settled
-	planShown  bool // widget currently installed for this model
+	renderCtx  *sdk.Context // newest context the widget render may read through
+	planPhase  int          // cells the bar may reveal; -1 once settled
+	planShown  bool         // widget currently installed for this model
 	planPct    float64
 	planAnim   uint64    // stale-animation guard
 	planWarn   sync.Once // "no data" is worth saying once per session
-	planWant   int64     // deferred plan work requested
-	planDone   int64     // ...and completed, so repeat turns cannot stack
+
+	// One background worker does every network read and every host push that a
+	// handler must not wait for. workPending makes repeat turns coalesce instead
+	// of stacking a goroutine per turn.
+	workPending bool
+	workRunning bool
+	workForce   bool // a session_start read, which ignores the cache
 }
 
 // Extension is pig's standard Go factory entry point.
@@ -152,12 +158,10 @@ func Extension() *sdk.Extension {
 		return nil, nil
 	})
 
+	// Account totals cost a fan-out over agents, so the refresh runs on the
+	// background worker, at most every PI_CURSOR_ACCOUNT_TTL_S (3 min default).
 	e.OnEvent("turn_end", func(ctx sdk.Context, _ map[string]any) (any, error) {
-		st.deferPlanWork(ctx, "turn_end")
-		// Account totals cost a fan-out over agents, so refresh at most every
-		// PI_CURSOR_ACCOUNT_TTL_S (3 min default) and skip the wait otherwise.
-		st.refreshAccount(ctx, false)
-		st.refreshStatus(ctx)
+		st.deferUsageWork(ctx, "turn_end")
 		return nil, nil
 	})
 
@@ -215,11 +219,10 @@ func Extension() *sdk.Extension {
 	e.OnSessionStart(func(ctx sdk.Context, _ map[string]any) (any, error) {
 		st.configure(ctx)
 		st.refreshStatus(ctx)
-		// Never call the host from inside this handler. The host is waiting for the
-		// handler's result, and ui.setWidget / the plan read (which reaches Cursor)
-		// both go back out over the same connection: called inline the handler never
-		// returns, the provider is never registered, and the model vanishes.
-		st.deferPlanWork(ctx, "session_start")
+		// Handlers stay local: the plan and account reads reach Cursor over the
+		// network, so they run on the background worker rather than making every
+		// session start wait on an HTTP round trip.
+		st.deferUsageWork(ctx, "session_start")
 		return nil, nil
 	})
 
@@ -385,10 +388,6 @@ func (s *state) saveKey(ctx sdk.Context, key string) error {
 		return err
 	}
 	// Re-register with the key so the catalog and availability update at once.
-	s.mu.Lock()
-	home := s.cfg.ConfigHome
-	_ = home
-	s.mu.Unlock()
 	s.reRegister(ctx)
 	return nil
 }
@@ -418,14 +417,20 @@ func (s *state) configHome(ctx sdk.Context) string {
 	return s.configHomeSDK()
 }
 
-func (s *state) configHomeSDK() string {
-	s.mu.Lock()
-	home := s.cfg.ConfigHome
-	s.mu.Unlock()
-	if home != "" {
-		return home
+// configHomeLocked resolves the pig home. It takes no lock, so a caller that
+// already holds s.mu can use it; [state.configHomeSDK] is the locking form.
+func (s *state) configHomeLocked() string {
+	if s.cfg.ConfigHome != "" {
+		return s.cfg.ConfigHome
 	}
 	return s.defaultConfigHome()
+}
+
+func (s *state) configHomeSDK() string {
+	s.mu.Lock()
+	home := s.configHomeLocked()
+	s.mu.Unlock()
+	return home
 }
 
 // ---- catalog --------------------------------------------------------------
@@ -464,10 +469,10 @@ func (s *state) loadCatalogLocked() *provider.Catalog {
 	if s.catalog != nil {
 		return s.catalog
 	}
-	home := s.cfg.ConfigHome
-	if home == "" {
-		home = s.configHomeSDK()
-	}
+	// Locked variant on purpose: the callers of this method hold s.mu, and the
+	// locking form would deadlock on the same mutex (see
+	// TestLoadCatalogLockedResolvesHomeWithoutRelocking).
+	home := s.configHomeLocked()
 	windows := provider.LoadContextWindows(home)
 	if items, err := readCatalog(filepath.Join(provider.DefaultStateDir(home), catalogFile)); err == nil && len(items) > 0 {
 		s.catalog = provider.BuildCatalog(items, windows)
@@ -560,6 +565,25 @@ func (s *state) engineRef() *provider.Engine {
 
 // ---- status ---------------------------------------------------------------
 
+// isCursorModel reports whether the active model belongs to this provider. The
+// host replicates the bare model id in [sdk.Context.Model] ("grok-4.7@500k:slow",
+// not "cursor/grok-4.7@500k:slow"), so the provider id is the reliable signal and
+// a "cursor/" prefix check silently never matches. A model the host has not
+// replicated yet reads "" and is treated as ours: the caller installs and lets the
+// next sync remove it, which turn_end guarantees.
+func isCursorModel(ctx sdk.Context) bool {
+	if p := ctx.ModelProvider(); p != "" {
+		return p == providerID
+	}
+	m := ctx.Model()
+	return m == "" || strings.HasPrefix(m, providerID+"/")
+}
+
+// cursorModelName is the active model without a provider prefix, for the footer.
+func cursorModelName(ctx sdk.Context) string {
+	return strings.TrimPrefix(ctx.Model(), providerID+"/")
+}
+
 // refreshStatus keeps one compact footer line. Cursor signals belong in the
 // status area, never in the transcript.
 func (s *state) refreshStatus(ctx sdk.Context) {
@@ -569,8 +593,7 @@ func (s *state) refreshStatus(ctx sdk.Context) {
 		pid = s.engine.BridgePID()
 	}
 	s.mu.Unlock()
-	full := ctx.Model()
-	if !strings.HasPrefix(full, providerID+"/") {
+	if !isCursorModel(ctx) {
 		ctx.ClearStatus(statusKey)
 		return
 	}
@@ -578,9 +601,16 @@ func (s *state) refreshStatus(ctx sdk.Context) {
 		ctx.ClearStatus(statusKey)
 		return
 	}
-	parts := []string{"cursor", strings.TrimPrefix(full, providerID+"/")}
+	parts := []string{"cursor", cursorModelName(ctx)}
 	if mode == "plan" {
 		parts = append(parts, "plan")
+	}
+	// The allowance lives in the widget above the editor. With the bar turned off
+	// it belongs here instead, so the number is still visible somewhere.
+	if os.Getenv("PI_CURSOR_PLAN_BAR") == "0" {
+		if snap := enginePlan(s.engineRef()); snap != nil {
+			parts = append(parts, formatPlan(snap))
+		}
 	}
 	if pid > 0 {
 		parts = append(parts, fmt.Sprintf("pid %d", pid))
@@ -760,8 +790,37 @@ func (s *state) setPlanPct(snap *planusage.Snapshot) {
 	s.mu.Unlock()
 }
 
+// planBarState is the plan-bar state syncPlanBar decides from, copied out under
+// one lock so no decision is made while the mutex is held.
+type planBarState struct {
+	shown    bool // widget currently installed for this model
+	havePlan bool // a plan snapshot exists, so the row has something to draw
+	render   func(width int) []string
+}
+
+// planBarState copies the state the bar needs. The engine has its own mutex and
+// never calls back into this package, so reading it under s.mu is a fixed lock
+// order (state → engine), not a cycle.
+func (s *state) planBarState() planBarState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := planBarState{shown: s.planShown, render: s.planRender}
+	if s.engine != nil {
+		if snap, _, _ := s.engine.Plan(); snap != nil {
+			out.havePlan = true
+		}
+	}
+	return out
+}
+
 // syncPlanBar makes the widget match the active model: a Cursor model gets the
 // bar, anything else gets the built-in layout back.
+//
+// Every state read here goes through planBarState, and s.mu is never held across
+// a host call. The version that held the lock and then called barShown() /
+// engineRef() (which lock the same mutex) hung the extension permanently on the
+// first turn_start: sync.Mutex is not reentrant, so the handler never returned,
+// the host waited on it, and pig froze on every chat and /reload.
 func (s *state) syncPlanBar(ctx sdk.Context) {
 	if os.Getenv("PI_CURSOR_PLAN_BAR") == "0" {
 		return
@@ -771,33 +830,31 @@ func (s *state) syncPlanBar(ctx sdk.Context) {
 	// "" in the session_start handler. Install anyway and let the renderer decide:
 	// a model that turns out not to be ours gets the widget removed on the next
 	// sync, which turn_end guarantees.
-	mine := model == "" || strings.HasPrefix(model, providerID+"/")
-	s.mu.Lock()
-	shown := s.barShown()
-	var havePlan bool
-	if eng := s.engineRef(); eng != nil {
-		snap, _, _ := eng.Plan()
-		havePlan = snap != nil
-	}
-	newLogger().Info("plan bar sync", "model", model, "mine", mine, "shown", shown,
-		"width", ctx.Width(), "planData", havePlan)
+	mine := isCursorModel(ctx)
+	st := s.planBarState()
+	newLogger().Info("plan bar sync", "model", model, "mine", mine, "shown", st.shown,
+		"width", ctx.Width(), "planData", st.havePlan)
 	if !mine {
-		if shown {
-			_ = ctx.SetWidgetRenderer(planWidgetKey, nil)
-			s.mu.Lock()
-			s.planShown = false
-			s.mu.Unlock()
+		if st.shown {
+			// Only forget the widget once the host accepted the removal, so a
+			// rejected call is retried on the next sync instead of leaving a bar
+			// on screen for a model that is not ours.
+			if err := ctx.SetWidgetRenderer(planWidgetKey, nil); err != nil {
+				newLogger().Warn("plan bar removal rejected by the host", "err", err.Error())
+				return
+			}
+			s.setPlanShown(false)
 		}
 		return
 	}
-	if !shown {
+	if !st.shown || st.render == nil {
 		s.installPlanBar(ctx)
 		return
 	}
 	// Already installed: re-push so the row is laid out for the live width. The
 	// host does not re-measure lines it was given, and a row that is too wide for
 	// the terminal is fatal to the TUI, not merely ugly.
-	_ = ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"})
+	_ = ctx.SetWidgetRenderer(planWidgetKey, st.render, sdk.WidgetOptions{"placement": "aboveEditor"})
 }
 
 func (s *state) barShown() bool {
@@ -806,17 +863,43 @@ func (s *state) barShown() bool {
 	return s.planShown
 }
 
-func (s *state) installPlanBar(ctx sdk.Context) {
+func (s *state) setPlanShown(shown bool) {
+	s.mu.Lock()
+	s.planShown = shown
+	s.mu.Unlock()
+}
+
+// planRenderFor records ctx as the one the widget may read through and returns the
+// stable renderer. The renderer keeps a context handle only as a source of live
+// state (model, provider, width), so it must always be the newest one: a width
+// change or a re-push can arrive long after the handler that installed the widget,
+// including across a session replacement, where the old context is stale and panics.
+func (s *state) planRenderFor(ctx sdk.Context) func(int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.renderCtx = &ctx
 	if s.planRender == nil {
-		s.planRender = func(width int) []string { return s.planBarLines(ctx, width) }
+		s.planRender = func(width int) []string {
+			s.mu.Lock()
+			c := s.renderCtx
+			s.mu.Unlock()
+			if c == nil {
+				return nil
+			}
+			return s.planBarLines(*c, width)
+		}
 	}
-	if err := ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"}); err != nil {
+	return s.planRender
+}
+
+// installPlanBar must not be called with s.mu held: it calls the host.
+func (s *state) installPlanBar(ctx sdk.Context) {
+	render := s.planRenderFor(ctx)
+	if err := ctx.SetWidgetRenderer(planWidgetKey, render, sdk.WidgetOptions{"placement": "aboveEditor"}); err != nil {
 		newLogger().Warn("plan bar rejected by the host", "err", err.Error())
 		return
 	}
-	s.mu.Lock()
-	s.planShown = true
-	s.mu.Unlock()
+	s.setPlanShown(true)
 	newLogger().Info("plan bar installed")
 }
 
@@ -829,7 +912,7 @@ func (s *state) planBarLines(ctx sdk.Context, width int) []string {
 	if os.Getenv("PI_CURSOR_WIDGET_PROBE") == "1" {
 		return []string{" PI-WIDGET-PROBE-OK"}
 	}
-	if !strings.HasPrefix(ctx.Model(), providerID+"/") {
+	if !isCursorModel(ctx) {
 		return nil
 	}
 	snap := enginePlan(s.engineRef())
@@ -889,18 +972,23 @@ func (s *state) animatePlanBar(ctx sdk.Context, snap *planusage.Snapshot) {
 	if os.Getenv("PI_CURSOR_PLAN_BAR") == "0" || snap == nil {
 		return
 	}
-	s.mu.Lock()
-	if !s.planShown {
-		s.mu.Unlock()
+	if !s.barShown() {
 		s.installPlanBar(ctx)
-		s.mu.Lock()
 	}
+	render := s.planRenderFor(ctx)
+	s.mu.Lock()
 	s.planAnim++
 	gen := s.planAnim
 	s.mu.Unlock()
 
 	cells := provider.BarCells(ctx.Width())
 	go func() {
+		// Same reason as the usage worker: this goroutine can outlive its context.
+		defer func() {
+			if r := recover(); r != nil {
+				newLogger().Warn("plan bar animation stopped", "panic", fmt.Sprint(r))
+			}
+		}()
 		for phase := 1; phase <= cells; phase++ {
 			time.Sleep(65 * time.Millisecond)
 			s.mu.Lock()
@@ -910,48 +998,96 @@ func (s *state) animatePlanBar(ctx sdk.Context, snap *planusage.Snapshot) {
 			if stale {
 				return
 			}
-			_ = ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"})
+			_ = ctx.SetWidgetRenderer(planWidgetKey, render, sdk.WidgetOptions{"placement": "aboveEditor"})
 		}
 		s.mu.Lock()
 		if s.planAnim == gen {
 			s.planPhase = -1 // settled: show the true fill
 		}
 		s.mu.Unlock()
-		_ = ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"})
+		_ = ctx.SetWidgetRenderer(planWidgetKey, render, sdk.WidgetOptions{"placement": "aboveEditor"})
 	}()
 }
 
-// deferPlanWork runs the plan read and the bar's host calls outside the event
-// handler that asked for them, on a single worker so repeated turns cannot stack.
-// The extension stays active after a handler returns, so the context is still
-// usable; what is not allowed is calling back into the host while the host is
-// blocked on that same handler.
-func (s *state) deferPlanWork(ctx sdk.Context, reason string) {
-	s.mu.Lock()
-	s.planWant++
-	want := s.planWant
-	ran := s.planDone
-	s.mu.Unlock()
-	if ran >= want {
+// deferUsageWork moves the two network reads (Cursor's plan allowance and the
+// account fan-out) and the widget/status pushes off the event handler that asked
+// for them. A handler that waits on the network makes the host look frozen: pig
+// is blocked on the handler's result for the whole round trip.
+//
+// One worker, single-flight: a request that arrives while it is running sets
+// workPending and is served by the same goroutine on its next pass, so a burst of
+// turns cannot stack goroutines or repeat the reads.
+func (s *state) deferUsageWork(ctx sdk.Context, reason string) {
+	if !s.requestWork(reason == "session_start") {
 		return
 	}
 	go func() {
-		s.mu.Lock()
-		if s.planDone >= want {
-			s.mu.Unlock()
-			return
-		}
-		s.planDone = want
-		s.mu.Unlock()
-
-		before := s.planPct
-		snap := s.refreshPlan(reason == "session_start")
-		if snap != nil {
-			s.setPlanPct(snap)
-		}
-		s.syncPlanBar(ctx)
-		if snap != nil && provider.PercentChanged(before, snapPercent(snap)) {
-			s.animatePlanBar(ctx, snap)
+		// A worker outlives the handler that started it, and its context goes stale
+		// when the session is replaced (/new, /resume, /fork). A stale read panics;
+		// the worker must log that instead of taking the extension process down.
+		defer func() {
+			if r := recover(); r != nil {
+				newLogger().Warn("background usage work stopped", "panic", fmt.Sprint(r))
+			}
+		}()
+		for {
+			force, ok := s.takeWork()
+			if !ok {
+				return
+			}
+			s.runUsageWork(ctx, force)
 		}
 	}()
+}
+
+// requestWork records a request and reports whether the caller must start the
+// worker. Every flag transition happens under s.mu, so a request that lands while
+// a pass is running (or just as the worker is about to exit) is never lost: either
+// it sees workRunning and is picked up by the next pass, or it starts a new worker.
+func (s *state) requestWork(force bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workPending = true
+	if force {
+		s.workForce = true
+	}
+	if s.workRunning {
+		return false
+	}
+	s.workRunning = true
+	return true
+}
+
+// takeWork claims the next pass, or reports that the worker should exit.
+func (s *state) takeWork() (force bool, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.workPending {
+		s.workRunning = false
+		return false, false
+	}
+	s.workPending = false
+	force, s.workForce = s.workForce, false
+	return force, true
+}
+
+// runUsageWork is one pass of the background worker: read, then show.
+func (s *state) runUsageWork(ctx sdk.Context, force bool) {
+	before := s.planPercent()
+	snap := s.refreshPlan(force)
+	if snap != nil {
+		s.setPlanPct(snap)
+	}
+	s.syncPlanBar(ctx)
+	if snap != nil && provider.PercentChanged(before, snapPercent(snap)) {
+		s.animatePlanBar(ctx, snap)
+	}
+	s.refreshAccount(ctx, false)
+	s.refreshStatus(ctx)
+}
+
+func (s *state) planPercent() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.planPct
 }
