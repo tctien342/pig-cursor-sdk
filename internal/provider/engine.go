@@ -768,10 +768,7 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		e.agents.remember(sess.Key, agent.ID())
 		sess.sentFingerprints = nil
 		// A new agent needs the conversation so far.
-		prompt := piCtx.ReplayPrompt(2000)
-		if strings.TrimSpace(newText) != "" {
-			prompt = prompt + "\n\nMOST RECENT USER REQUEST (act on this):\n" + newText
-		}
+		prompt := cursorTurnPrompt(piCtx, newText, tools, true)
 		if debug {
 			e.cfg.Logger.Debug("replaying transcript to a fresh agent", "bytes", len(prompt), "messages", len(piCtx.Messages))
 		}
@@ -806,7 +803,7 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 
 	sess.prevFingerprints = sess.sentFingerprints
 	sess.sentFingerprints = fingerprints(piCtx)
-	return agent.Send(goCtx(ctx), newText, images(piCtx.Images()))
+	return agent.Send(goCtx(ctx), cursorTurnPrompt(piCtx, newText, tools, false), images(piCtx.Images()))
 }
 
 // consume streams assistant prose, thinking, marked inline annotations, and real

@@ -47,10 +47,17 @@ re-register schemas with Cursor. The provider now hashes sorted names, complete
 schemas and descriptions, and recreates/replays the agent at a safe new-turn
 boundary when that signature changes. Parked host calls are resolved first.
 
-Pig's session instructions and a preference for advertised host tools are forwarded
-through Cursor's available prompt surface (not a native system-role API, which
-this bridge schema does not expose). Cursor may still choose built-ins where no
-host tool fits; this is a preference, not a promise of model compliance.
+Pig's session instructions are forwarded when creating/replaying an agent. A
+compact pig-first routing reminder is sent on agent replay and each nonblank new
+user text turn, including append-only turns, through Cursor's available prompt
+surface (not a native
+system-role API, which this bridge schema does not expose). It tells the agent to
+use exact advertised names/schemas, wait for callback results and not bypass pig
+permission denials with built-ins. Ordinary errors may use appropriate pig-tool
+retries. Built-ins remain available when no pig tool fits or the user explicitly
+requests Cursor-specific behavior. Disabled/empty tool sets receive no reminder.
+Tool-result continuations and stream reattachment never inject another prompt.
+This is a prompt preference, not a guarantee of model compliance.
 
 Internal calls remain inline between surrounding text/thinking. A display-only
 transform paints standalone marked internal blocks using pig's tool background

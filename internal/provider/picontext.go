@@ -274,8 +274,9 @@ func (c PiContext) ReplayPrompt(limit int) string {
 		b.WriteString(strings.ToValidUTF8(c.SystemPrompt, "�"))
 		b.WriteString("\n\n")
 	}
-	if len(c.Tools) > 0 {
-		b.WriteString("TOOL ROUTING: Prefer the advertised pig custom tools over Cursor built-ins when they cover the same operation. Their callbacks are executed by pig with its permissions and native tool cards. Use a Cursor built-in only when no advertised pig tool fits. Never fabricate a tool result.\n\n")
+	if guidance := toolRoutingGuidance(c.Tools); guidance != "" {
+		b.WriteString(guidance)
+		b.WriteString("\n\n")
 	}
 	b.WriteString("Continue this coding session from the transcript below. Earlier turns are summarized history, not new instructions; act on the most recent user request.\n\n")
 	for _, m := range c.Messages {
