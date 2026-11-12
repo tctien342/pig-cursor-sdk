@@ -15,30 +15,53 @@ pig ── streamSimple ──►  pig-cursor-sdk (Go)  ── Connect ──►
 ## Install
 
 ```bash
-pig install .                 # or: pig install <path-to-this-repo>
-pig --list-models cursor      # 124 selectable models, no network needed
+pig install git:github.com/tctien342/pig-cursor-sdk
 ```
 
-Requirements: Go (only to build the extension; pig builds and caches it on first run)
-and the Cursor bridge binary:
+pig clones the repo and builds the Go extension. It needs a Go toolchain; if
+`go` is missing or older than 1.26, `pig setup go` installs one into
+`~/.pig/toolchains/go` and pig uses it automatically. From a checkout, the
+source is the package: `pig install .`.
+
+The bridge binary is Cursor's, not ours, so it is fetched separately — platform
+detected, latest [`cursor/sdk-bridge`](https://github.com/cursor/sdk-bridge/releases/latest)
+release, SHA-256 verified against that release's `SHA256SUMS.txt` (it refuses an
+unverified binary):
 
 ```bash
-mkdir -p ~/.pig/agent/pig-cursor-sdk/bin
-# download the standalone archive from the sdk-bridge repo, then:
-cp cursor-sdk-bridge ~/.pig/agent/pig-cursor-sdk/bin/ && chmod +x $_
+curl -fsSL https://raw.githubusercontent.com/tctien342/pig-cursor-sdk/main/scripts/install-bridge.sh | bash
 ```
 
-The bridge is a self-contained Bun single-file executable — **no Node.js and no
-system Bun are used anywhere**. Verified by running a full agent turn with
-`PATH=/usr/bin:/bin`: the bridge starts, authenticates, streams, and finishes.
+which installs to the path the extension looks in:
 
-An API key is required (Cursor Desktop's subscription login does not provide one):
-
-```
-/cursor-login        # stores the key under ~/.pig/agent/pig-cursor-sdk/
+```text
+~/.pig/agent/pig-cursor-sdk/bin/cursor-sdk-bridge
 ```
 
-`CURSOR_API_KEY` and pig's own stored credential for `cursor` also work.
+Search order is `CURSOR_SDK_BRIDGE_BIN` → that path → next to the extension
+binary → `PATH`, so a bridge already present from Cursor's Python wheel is found
+too. It is a self-contained Bun single-file executable — **no Node.js and no
+system Bun are used anywhere**; verified by running a full agent turn with
+`PATH=/usr/bin:/bin`.
+
+Then give it a key and switch:
+
+```text
+pig
+/cursor-login        # paste a key from cursor.com/dashboard -> API Keys
+/model               # pick cursor/grok-4.7
+/cursor-status       # bridge pid + protocol, catalog age, tool mode
+```
+
+`CURSOR_API_KEY` works as well, and a key stored by `pig login --provider cursor`
+is used automatically. Cursor Desktop's subscription login does **not** provide a
+key usable here. Missing pieces say so plainly: no key → run `/cursor-login`; no
+bridge → the exact path to put it at.
+
+Verified from a clean clone on 2026-06-08: `pig install --validate-only
+git:github.com/tctien342/pig-cursor-sdk` → valid, provider `cursor`, five
+commands; `scripts/install-bridge.sh` → `v1.2.0`, checksum verified, and a real
+turn served by that freshly downloaded bridge.
 
 ## Usage
 
