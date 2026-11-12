@@ -23,6 +23,8 @@ pid, fd = pty.fork()   # pty.fork returns (pid, fd), not (fd, pid)
 if pid == 0:
     os.execvpe("pig", ["pig", "-e", ".", "--model", "cursor/grok-4.7"], env)
     os._exit(127)
+import fcntl, struct, termios
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))  # rows, cols
 out = open("/tmp/pi-bar-raw.log", "ab")
 deadline = time.time() + 120
 t0 = time.time()
