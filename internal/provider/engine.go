@@ -44,6 +44,11 @@ type Engine struct {
 	startErr string
 	override ModelOverride
 	agents   *agentRegistry
+
+	// lastRate is the most recent usage window Cursor reported when refusing a
+	// call. sdk.v1 has no proactive limit RPC, so this is opportunistic: it is
+	// shown once Cursor has told us, and dropped once that window has reset.
+	lastRate *cursor.RateLimit
 }
 
 // SetModelOverride installs the thinking/fast controls for later turns.
@@ -1057,6 +1062,7 @@ func usageMap(u *cursor.Usage) map[string]any {
 }
 
 func (e *Engine) fail(stream *sdk.ModelEventStream, model map[string]any, modelID string, err error) {
+	e.noteRate(err)
 	e.cfg.Logger.Error("cursor provider request failed", "model", modelID, "err", err)
 	p := newPartial(model, &ModelEntry{ID: modelID})
 	p.msg["stopReason"] = "error"
@@ -1067,10 +1073,39 @@ func (e *Engine) fail(stream *sdk.ModelEventStream, model map[string]any, modelI
 	stream.End(p.msg)
 }
 
+// noteRate remembers a usage window Cursor attached to a refusal.
+func (e *Engine) noteRate(err error) {
+	if r := cursor.RateOf(err); r != nil {
+		e.mu.Lock()
+		e.lastRate = r
+		e.mu.Unlock()
+	}
+}
+
+// LimitWindow returns the usage window Cursor last reported, or nil when it never
+// reported one or the reported window has already reset.
+func (e *Engine) LimitWindow() *cursor.RateLimit {
+	e.mu.Lock()
+	r := e.lastRate
+	e.mu.Unlock()
+	if r == nil {
+		return nil
+	}
+	if r.HasReset && time.Now().After(r.ResetAt) {
+		return nil
+	}
+	return r
+}
+
 // humanError turns a provider failure into one actionable line. A fresh install
 // is the most likely cause of a startup failure, so it names the path to fix.
 func (e *Engine) humanError(err error) string {
 	msg := err.Error()
+	if r := cursor.RateOf(err); r != nil {
+		if sum := r.Summary(time.Now()); sum != "" {
+			return msg + " — Cursor usage window: " + sum
+		}
+	}
 	if strings.Contains(msg, "bridge binary not found") {
 		return "Cursor bridge is not installed. Put the cursor-sdk-bridge executable at " +
 			cursor.InstallPath() + " (see the repository README), or point CURSOR_SDK_BRIDGE_BIN at it. Original error: " + msg

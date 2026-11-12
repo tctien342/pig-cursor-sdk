@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"connectrpc.com/connect"
 	sdkpb "github.com/tctien342/pig-cursor-sdk/gen/sdk/v1"
@@ -20,6 +21,7 @@ const (
 	CodePlanRequired    ErrorCode = "plan_required"
 	CodeNotFound        ErrorCode = "not_found"
 	CodeRateLimit       ErrorCode = "rate_limit"
+	CodeUsageLimit      ErrorCode = "usage_limit"
 	CodeBusy            ErrorCode = "busy"
 	CodeValidation      ErrorCode = "validation"
 	CodeConflict        ErrorCode = "conflict"
@@ -42,6 +44,7 @@ type Error struct {
 	HelpURL    string
 	Provider   string
 	RetryAfter string
+	Rate       *RateLimit // present when Cursor described the window it refused on
 	Cause      error
 }
 
@@ -108,6 +111,19 @@ func wrapErr(op string, err error) error {
 			if ra := det.GetRetryAfter(); ra != nil {
 				e.RetryAfter = ra.AsDuration().String()
 			}
+			if rl := det.GetRateLimit(); rl != nil {
+				r := &RateLimit{}
+				if v := rl.GetLimit(); v != 0 {
+					r.Limit, r.HasLimit = int64(v), true
+				}
+				if v := rl.GetRemaining(); v != 0 {
+					r.Remaining, r.HasRemaining = int64(v), true
+				}
+				if v := rl.GetResetEpochSeconds(); v != 0 {
+					r.ResetAt, r.HasReset = time.Unix(int64(v), 0), true
+				}
+				e.Rate = r
+			}
 		}
 		e.Code = classify(det(e.SDKCode), cerr.Code(), cerr.Message())
 		return e
@@ -142,7 +158,11 @@ func classify(sdkCode string, code connect.Code, msg string) ErrorCode {
 		"SDK_ERROR_CODE_INVALID_BRANCH_NAME", "SDK_ERROR_CODE_REPOSITORY_REQUIRED",
 		"SDK_ERROR_CODE_REPOSITORY_ACCESS", "SDK_ERROR_CODE_PR_RESOLUTION_FAILED":
 		return CodeValidation
-	case "SDK_ERROR_CODE_USAGE_LIMIT_EXCEEDED", "SDK_ERROR_CODE_RATE_LIMIT_EXCEEDED":
+	case "SDK_ERROR_CODE_USAGE_LIMIT_EXCEEDED":
+		// A plan allotment, not a burst: worth telling apart because the fix is
+		// waiting for the window to reset, not backing off.
+		return CodeUsageLimit
+	case "SDK_ERROR_CODE_RATE_LIMIT_EXCEEDED":
 		return CodeRateLimit
 	case "SDK_ERROR_CODE_AGENT_BUSY", "SDK_ERROR_CODE_RUN_NOT_CANCELLABLE", "SDK_ERROR_CODE_AGENT_ARCHIVED":
 		return CodeBusy
@@ -184,4 +204,68 @@ func classify(sdkCode string, code connect.Code, msg string) ErrorCode {
 		return CodePlanRequired
 	}
 	return CodeUnknown
+}
+
+// RateLimit is the usage window Cursor reports when it refuses a call: what the
+// window allows, what is left, and when it resets.
+//
+// This is the only limit data sdk.v1 exposes, and it arrives only on a refusal —
+// there is no proactive "how much of my plan have I used" RPC. Callers show it
+// where it is useful (the error message and the footer) and say nothing otherwise,
+// rather than implying silence means headroom.
+type RateLimit struct {
+	Limit        int64
+	Remaining    int64
+	ResetAt      time.Time
+	HasLimit     bool
+	HasRemaining bool
+	HasReset     bool
+}
+
+// Summary renders the window as one line: "0 of 500 left · resets 21:05". Missing
+// fields are left out instead of guessed.
+func (r *RateLimit) Summary(now time.Time) string {
+	if r == nil {
+		// A bare window report still reads better than a raw error code.
+		return ""
+	}
+	parts := []string{}
+	switch {
+	case r.HasLimit && r.HasRemaining:
+		parts = append(parts, fmt.Sprintf("%d of %d left", r.Remaining, r.Limit))
+	case r.HasRemaining:
+		parts = append(parts, fmt.Sprintf("%d left", r.Remaining))
+	case r.HasLimit:
+		parts = append(parts, fmt.Sprintf("limit %d", r.Limit))
+	}
+	if r.HasReset {
+		until := r.ResetAt.Sub(now)
+		if until < 0 {
+			until = 0
+		}
+		parts = append(parts, "resets "+humanDuration(until)+" ("+r.ResetAt.Local().Format("15:04")+")")
+	}
+	return strings.Join(parts, " · ")
+}
+
+func humanDuration(d time.Duration) string {
+	switch {
+	case d >= 48*time.Hour:
+		return fmt.Sprintf("in %dd", int(d.Hours())/24)
+	case d >= time.Hour:
+		return fmt.Sprintf("in %dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	case d >= time.Minute:
+		return fmt.Sprintf("in %dm", int(d.Minutes()))
+	default:
+		return "now"
+	}
+}
+
+// RateOf returns the usage window carried by an error, or nil.
+func RateOf(err error) *RateLimit {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Rate
+	}
+	return nil
 }

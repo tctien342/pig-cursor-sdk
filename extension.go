@@ -156,6 +156,11 @@ func Extension() *sdk.Extension {
 		} else {
 			lines = append(lines, "cost: not reported by Cursor for this account")
 		}
+		if w := limitWindow(eng); w != "" {
+			lines = append(lines, "window: "+w+" (reported by Cursor when it refused a call)")
+		} else {
+			lines = append(lines, "window: Cursor reports no usage-limit RPC, so nothing is known until it refuses a call")
+		}
 		lines = append(lines, "scope: the Cursor agents this pig session created — Cursor exposes no account-wide usage API")
 		ctx.Notify(strings.Join(lines, "\n"), "info")
 		return nil
@@ -580,4 +585,18 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// limitWindow renders Cursor's reported usage window, if any. The bridge protocol
+// carries limit data only on a refusal (SdkErrorDetails.rate_limit), so an empty
+// string means "Cursor has not told us", not "there is headroom".
+func limitWindow(eng *provider.Engine) string {
+	if eng == nil {
+		return ""
+	}
+	r := eng.LimitWindow()
+	if r == nil {
+		return ""
+	}
+	return "limit " + r.Summary(time.Now())
 }

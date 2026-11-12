@@ -105,6 +105,32 @@ amount and as `… raw` when it only reports undiscounted model cost (plan-inclu
 BYOK, and grant accounts report no charged figure, so the label matters).
 `/cursor-usage` gives the in/out/reasoning split and the run count.
 
+### Limits ("how much of my plan is left")
+
+The bridge protocol has **no** usage-limit RPC. The only limit data in `sdk.v1`
+rides on a refusal: `SdkErrorDetails.rate_limit` carries `limit`, `remaining`, and
+`reset_epoch_seconds`. So this extension records that window the moment Cursor
+reports one and keeps showing it until the window resets — in the footer
+
+```text
+cursor · grok-4.7 · limit 0 of 500 left · resets in 2h05m (21:05)
+```
+
+and inside the failure itself, so a rejected turn reads
+
+```text
+cursor run stream: usage limit exceeded — Cursor usage window: 0 of 500 left · resets in 2h05m (21:05)
+```
+
+`/cursor-usage` prints the same window, and says outright when nothing is known:
+*"Cursor reports no usage-limit RPC, so nothing is known until it refuses a call."*
+An absent line means *Cursor has not told us*, never *you have headroom*.
+
+Cursor's own desktop app does show weekly / rolling-window allotments; that comes
+from an internal API the SDK bundles and the bridge does not expose, so reading it
+here would mean scraping an undocumented endpoint with your key. Say the word if
+you want that anyway — it is opt-in territory, not a default.
+
 Scope, stated plainly because the protocol sets the limit: `sdk.v1` exposes usage
 per agent and no account-wide usage or plan-limit RPC (`SdkCursorService` has only
 `Me`, `ListModels`, `ListRepositories`). So the footer reads *what these agents
@@ -173,6 +199,9 @@ python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty
 - `/cursor-abort` releases the run this pig process is holding. A run left active
   by a process that died is not cancelled eagerly: the next send notices the agent
   still owns an upstream run, releases it, and starts a clean one (logged at INFO).
+- No plan-limit data before a refusal: `sdk.v1` exposes usage limits only inside
+  error details, so weekly / rolling-window "X of Y used" cannot be read in
+  advance (see *Limits* above).
 - If Cursor answers with one of *its own* built-in tools instead of a host tool,
   no card renders — there is no host tool to attach one to. The footer says
   `Cursor ran Shell (its own tool)` instead; a transcript line for it would be

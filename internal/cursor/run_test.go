@@ -388,7 +388,7 @@ func TestErrorClassification(t *testing.T) {
 	cases := map[string]ErrorCode{
 		"SDK_ERROR_CODE_UNAUTHORIZED":         CodeAuth,
 		"SDK_ERROR_CODE_API_KEY_NOT_FOUND":    CodeAuth,
-		"SDK_ERROR_CODE_USAGE_LIMIT_EXCEEDED": CodeRateLimit,
+		"SDK_ERROR_CODE_USAGE_LIMIT_EXCEEDED": CodeUsageLimit, // a plan window, not a burst
 		"SDK_ERROR_CODE_AGENT_BUSY":           CodeBusy,
 		"SDK_ERROR_CODE_INVALID_MODEL":        CodeValidation,
 		"SDK_ERROR_CODE_UPSTREAM_ERROR":       CodeUpstream,
@@ -407,5 +407,33 @@ func TestErrorClassification(t *testing.T) {
 	}
 	if Retryable(&Error{Code: CodeAuth}) {
 		t.Error("auth failure should not be retried")
+	}
+}
+
+// Cursor only describes a usage window when it refuses a call, so the rendering
+// has to work with whatever subset it sends and invent nothing.
+func TestRateLimitSummaryShowsOnlyWhatCursorReported(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	cases := []struct {
+		name string
+		rate *RateLimit
+		want string
+	}{
+		{"nil", nil, ""},
+		{"empty", &RateLimit{}, ""},
+		{"limit and remaining", &RateLimit{Limit: 500, HasLimit: true, Remaining: 12, HasRemaining: true}, "12 of 500 left"},
+		{"remaining only", &RateLimit{Remaining: 3, HasRemaining: true}, "3 left"},
+		{"limit only", &RateLimit{Limit: 500, HasLimit: true}, "limit 500"},
+		{
+			"with reset",
+			&RateLimit{Remaining: 0, HasRemaining: true, ResetAt: now.Add(2*time.Hour + 5*time.Minute), HasReset: true},
+			"0 left · resets in 2h05m (" + now.Add(125*time.Minute).Local().Format("15:04") + ")",
+		},
+		{"reset already past", &RateLimit{HasReset: true, ResetAt: now.Add(-time.Hour)}, "resets now (" + now.Add(-time.Hour).Local().Format("15:04") + ")"},
+	}
+	for _, c := range cases {
+		if got := c.rate.Summary(now); got != c.want {
+			t.Errorf("%s: Summary = %q, want %q", c.name, got, c.want)
+		}
 	}
 }
