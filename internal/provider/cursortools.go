@@ -143,10 +143,10 @@ func (t *cursorToolTracker) finish() {
 // the same outcome, so a Cursor-side line is read as a tool call and not as prose.
 func (c cursorToolCard) backgroundToken() string {
 	switch c.status {
+	case "running", "unfinished":
+		return "toolPendingBg"
 	case "failed":
 		return "toolErrorBg"
-	case "unfinished":
-		return "toolPendingBg"
 	default:
 		return "toolSuccessBg"
 	}
@@ -424,6 +424,8 @@ func cursorToolLines(card cursorToolCard, color func(token, text string) string,
 	label := color("toolTitle", "cursor: "+card.tool)
 	statusWord, statusToken := "", "toolOutput"
 	switch card.status {
+	case "running":
+		statusWord = "running"
 	case "failed":
 		statusWord, statusToken = "failed", "error"
 	case "unfinished":
@@ -631,6 +633,77 @@ func withCardPadding(lines []string) []string {
 	out = append(out, "")
 	out = append(out, lines...)
 	return append(out, "")
+}
+
+// LiveToolView is one Cursor-side call as it stands right now, for a host UI that
+// shows it while the turn streams. Status is "running", "completed" or "failed".
+type LiveToolView struct {
+	Tool    string
+	Summary string
+	Status  string
+	Seconds int
+}
+
+// liveToolLimit is how many cards the live widget shows. A turn can run dozens of
+// calls; the widget is a glance, not a log — the transcript keeps the whole list.
+const liveToolLimit = 6
+
+// snapshot returns this turn's calls in order, as the live widget should draw them.
+// Running calls are last, because that is where the reader's eye needs to be.
+func (t *cursorToolTracker) snapshot() []LiveToolView {
+	if t == nil {
+		return nil
+	}
+	out := make([]LiveToolView, 0, len(t.order))
+	for _, id := range t.order {
+		call := t.calls[id]
+		view := LiveToolView{Tool: call.tool, Summary: cursorToolSummary(call.tool, call.args)}
+		switch {
+		case !call.finished:
+			view.Status = "running"
+		case call.isError:
+			view.Status = "failed"
+			view.Seconds = call.entry().Seconds
+		default:
+			view.Status = "completed"
+			view.Seconds = call.entry().Seconds
+		}
+		out = append(out, view)
+	}
+	if len(out) > liveToolLimit {
+		out = out[len(out)-liveToolLimit:]
+	}
+	return out
+}
+
+// RenderLiveToolCards draws those calls for a widget above the editor: one card
+// row each, in call order, painted with the same background a host tool card gets
+// for that outcome. A finished call turns from the pending colour to the success
+// colour where it stands, which is what makes the widget read as tools running
+// rather than as a status line.
+func RenderLiveToolCards(calls []LiveToolView, theme sdk.UITheme, width int) []string {
+	if len(calls) == 0 {
+		return nil
+	}
+	color := func(token, text string) string {
+		if text == "" {
+			return ""
+		}
+		return theme.Fg(token, text)
+	}
+	out := make([]string, 0, len(calls))
+	for _, view := range calls {
+		card := cursorToolCard{tool: view.Tool, summary: view.Summary, status: view.Status, seconds: view.Seconds}
+		lines := cursorToolLines(card, color, false, width)
+		token := card.backgroundToken()
+		if ansi, err := theme.GetBgAnsi(token); err == nil && strings.Contains(ansi, "48") {
+			for i, line := range lines {
+				lines[i] = paintCursorToolLine(line, width, func(text string) string { return theme.Bg(token, text) })
+			}
+		}
+		out = append(out, lines...)
+	}
+	return out
 }
 
 // cursorToolHint is the live footer line for a call still running. It is the only

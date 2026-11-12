@@ -34,6 +34,12 @@ type Config struct {
 	Logger         *slog.Logger
 	// DisableHostTools advertises no tools at all (escape hatch for testing).
 	DisableHostTools bool
+
+	// LiveTools is called as Cursor-side tool calls start and finish, and with nil
+	// when the turn is over. The host uses it to draw them while the turn streams:
+	// transcript entries cannot, because anything appended mid-turn lands above the
+	// message it belongs to. Nil disables it.
+	LiveTools func(ctx sdk.Context, calls []LiveToolView)
 }
 
 // Engine owns the bridge process, the model catalog, and one session lease per
@@ -829,11 +835,15 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	// cursorToolTracker.finish. A retried turn reports its own calls, so its
 	// discarded attempt writes nothing.
 	defer func() {
-		if ct == nil || outcome.retry || outcome.recover {
-			return
+		if ct != nil && !outcome.retry && !outcome.recover {
+			ct.finish()
 		}
-		ct.finish()
 		ctx.ClearStatus("cursor-activity")
+		// The cards move into the transcript here, so the live widget has nothing
+		// left to show.
+		if e.cfg.LiveTools != nil {
+			e.cfg.LiveTools(ctx, nil)
+		}
 	}()
 
 	em.begin()
@@ -872,6 +882,9 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 			} else {
 				// The line in the transcript says it better than the footer can.
 				ctx.ClearStatus("cursor-activity")
+			}
+			if e.cfg.LiveTools != nil {
+				e.cfg.LiveTools(ctx, ct.snapshot())
 			}
 		}
 		if em.add(ev) {

@@ -50,6 +50,14 @@ type state struct {
 	planAnim   uint64    // stale-animation guard
 	planWarn   sync.Once // "no data" is worth saying once per session
 
+	// Live Cursor-side tool cards, above the editor, while a turn streams. The
+	// transcript cannot show them yet (an entry appended mid-turn lands above the
+	// message), so this is what makes the calls visible while they happen.
+	liveTools  []provider.LiveToolView
+	liveCtx    *sdk.Context // newest context the live widget may read through
+	liveRender func(int) []string
+	liveShown  bool
+
 	// One background worker does every network read and every host push that a
 	// handler must not wait for. workPending makes repeat turns coalesce instead
 	// of stacking a goroutine per turn.
@@ -271,6 +279,7 @@ func (s *state) configure(ctx sdk.Context) {
 		SettingSources: settingSourcesFromEnv(),
 		Mode:           s.mode,
 		Logger:         newLogger(),
+		LiveTools:      s.pushLiveTools,
 	}
 	// The Cursor-tool renderer is a plain function with no config; this is the
 	// point where a logger exists to hand it.
@@ -314,6 +323,7 @@ func (s *state) engineFor(ctx sdk.Context) *provider.Engine {
 			ConfigHome: home,
 			Logger:     newLogger(),
 			Mode:       s.mode,
+			LiveTools:  s.pushLiveTools,
 		}
 		s.rebuildEngineLocked()
 	}
@@ -771,6 +781,70 @@ func limitWindow(eng *provider.Engine) string {
 		return ""
 	}
 	return "limit " + r.Summary(time.Now())
+}
+
+// ---- live Cursor-side tool cards -------------------------------------------
+
+const toolsWidgetKey = "cursor-tools"
+
+// pushLiveTools draws the turn's Cursor-side calls above the editor while the turn
+// streams, and clears the widget when the turn ends.
+//
+// This exists because the transcript cannot: pig commits an assistant message at
+// the end of the turn, so an entry appended while it streams lands above that
+// message. A widget is the one surface that can show "shell · git diff …" *now*
+// and then be replaced by the same cards in the transcript.
+func (s *state) pushLiveTools(ctx sdk.Context, calls []provider.LiveToolView) {
+	if os.Getenv("PI_CURSOR_SHOW_TOOLS") == "0" {
+		return // same switch that turns the transcript cards off
+	}
+	s.mu.Lock()
+	s.liveTools = calls
+	ctxCopy := ctx
+	s.liveCtx = &ctxCopy
+	shown := s.liveShown
+	s.mu.Unlock()
+
+	if len(calls) == 0 {
+		if shown {
+			if err := ctx.SetWidgetRenderer(toolsWidgetKey, nil); err != nil {
+				newLogger().Debug("live tool widget removal rejected", "err", err.Error())
+				return
+			}
+			s.mu.Lock()
+			s.liveShown = false
+			s.mu.Unlock()
+		}
+		return
+	}
+	if err := ctx.SetWidgetRenderer(toolsWidgetKey, s.liveToolRender(), sdk.WidgetOptions{"placement": "aboveEditor"}); err != nil {
+		newLogger().Debug("live tool widget rejected by the host", "err", err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.liveShown = true
+	s.mu.Unlock()
+}
+
+// liveToolRender returns the stable renderer the host calls with the pane width.
+// It reads through the newest context, never a captured one: a width change or a
+// repaint can arrive after a session replacement, and the old context panics.
+func (s *state) liveToolRender() func(int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.liveRender == nil {
+		s.liveRender = func(width int) []string {
+			s.mu.Lock()
+			calls := s.liveTools
+			c := s.liveCtx
+			s.mu.Unlock()
+			if c == nil || len(calls) == 0 {
+				return nil
+			}
+			return provider.RenderLiveToolCards(calls, c.UITheme(), width)
+		}
+	}
+	return s.liveRender
 }
 
 // ---- plan bar widget ------------------------------------------------------

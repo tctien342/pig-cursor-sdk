@@ -202,6 +202,11 @@ line itself:
    command: grep -rn deferPlanWork .        # ctrl+o for the arguments
 ```
 
+While the turn runs, the same cards appear in a widget above the editor — a running
+call in the pending colour, turning green with its duration when it ends — and move
+into the transcript when the turn finishes, so a call is never silent while it works
+and never recorded twice.
+
 One line per call, drawn as a card in pig's own tool-card colours — the background
 band covers an empty row, the line, and an empty row, so calls in a burst read as
 separate calls. Written after the turn's message is committed, never while it
@@ -272,6 +277,7 @@ python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty
 dev/.venv/bin/python dev/tty-cursor-tools.py  # Cursor's own tools on screen: live, ctrl+o, and after resume
 dev/.venv/bin/python dev/tty-two-sessions.py  # sessions in one directory: one exits, the rest survive
 dev/.venv/bin/python dev/tty-interrupt.py    # a message sent while Cursor is working still gets an answer
+dev/.venv/bin/python dev/tty-live-tools.py   # the running card is on screen during the call, once after
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
 cd dev && go run ./cmd/planprobe  # plan numbers + timings, without starting pig
 ```

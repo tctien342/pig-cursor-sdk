@@ -113,10 +113,26 @@ inside a thought. Below the message they read as what they are: that turn's
 activity, in call order. A turn that ends before retrying writes nothing — its
 retry reports its own calls.
 
+### While the turn runs: cards above the editor
+
 Because the lines arrive at the end of the turn, a long turn would otherwise show
-nothing at all while Cursor works. The footer carries the live picture instead:
+nothing at all while Cursor works. So the same cards are drawn in a widget above the
+editor as each call starts, updated when it ends — a running call in the pending
+colour saying `running`, which turns into the success colour with its duration where
+it stands. Up to six are shown, oldest dropped first; the transcript keeps the whole
+list. When the turn ends the widget is cleared and the cards are written into the
+transcript, so the call appears exactly once in the record.
+
+The footer carries the one-line summary while that happens:
 `Cursor 3 done · running shell · git diff …` — the running call, and how many have
 already finished.
+
+This is the closest a Cursor-side call can get to a host tool card. A host tool is a
+content block inside the assistant message, so pig streams its card in place; a
+Cursor-side call is not a host tool and must never become a content block, because
+everything in the message is replayed to the model. A widget and a session entry are
+the two surfaces that are not model context, so the call is shown in both: live in
+the widget, permanent in the entry.
 
 Why an entry and not a provider event or a message:
 
@@ -149,13 +165,15 @@ activity is never silently invisible.
 | nothing is written until the message is committed | `TestTrackerWritesNothingUntilTheTurnIsCommitted` |
 | the band is painted blank row, line, blank row | `TestCursorToolCardPadsInsideTheBackground`, `TestPaintCursorToolLineFillsTheWidth` |
 | the band colour follows the outcome | `TestCursorToolBackgroundMatchesOutcome` |
+| the live view shows running last, capped | `TestLiveToolSnapshotMarksTheRunningCall` |
 
 Live proof: `dev/tty-cursor-tools.py` — runs a turn with no host tools advertised
 (so Cursor can only use its own), asserts the line is on the real screen, that the
 three rows of the card share a background **as cells on the emulated screen** (not
 as escape codes that were merely written), that ctrl+o expands it, that the entry
 sits below its message in the session file, and that reopening the session draws it
-again from the entry.
+again from the entry, and that the running card is on screen while the call runs
+(`dev/tty-live-tools.py`).
 
 ## A batch of tool calls is one turn
 

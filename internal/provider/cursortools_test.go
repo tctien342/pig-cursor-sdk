@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
+
 	cursor "github.com/tctien342/pig-cursor-sdk/internal/cursor"
 )
 
@@ -310,5 +312,71 @@ func TestCursorToolDurationOnlyWhenMeasured(t *testing.T) {
 	fresh := &cursorToolCall{id: "y", tool: "shell", startedAt: time.Now(), finished: false}
 	if got := fresh.entry().Seconds; got != 0 {
 		t.Errorf("an instant call should show no duration, got %d", got)
+	}
+}
+
+// The live widget has to say "running" for the call that is still going, keep call
+// order, and stay short enough to sit above the editor.
+func TestLiveToolSnapshotMarksTheRunningCall(t *testing.T) {
+	tr := &cursorToolTracker{
+		appendEntry: func(map[string]any) error { return nil },
+		log:         discardLogger(),
+		calls:       map[string]*cursorToolCall{},
+		wrote:       map[string]bool{},
+	}
+	start := func(id, tool string, args map[string]any) cursor.RunEvent {
+		return cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolStarted,
+			ToolCall: &cursor.ToolCallEvent{ID: id, ToolName: tool, Args: args, Status: "running"}}}
+	}
+	done := func(id, tool string, isError bool) cursor.RunEvent {
+		return cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolCompleted,
+			ToolCall: &cursor.ToolCallEvent{ID: id, ToolName: tool, Status: "completed", IsError: isError}}}
+	}
+	tr.note(start("a", "shell", map[string]any{"command": "ls -1"}))
+	tr.note(done("a", "shell", false))
+	tr.note(start("b", "grep", map[string]any{"pattern": "deferPlanWork"}))
+	tr.note(done("b", "grep", true))
+	tr.note(start("c", "read", map[string]any{"path": "src/x.go"}))
+
+	views := tr.snapshot()
+	if len(views) != 3 {
+		t.Fatalf("want three calls, got %+v", views)
+	}
+	if views[0].Status != "completed" || views[0].Summary != "ls -1" {
+		t.Errorf("first call = %+v", views[0])
+	}
+	if views[1].Status != "failed" || views[1].Summary != "deferPlanWork" {
+		t.Errorf("failed call = %+v", views[1])
+	}
+	if views[2].Status != "running" || views[2].Tool != "read" {
+		t.Errorf("the running call must stay last and say so: %+v", views[2])
+	}
+	if got := tr.done(); got != 2 {
+		t.Errorf("done = %d, want 2", got)
+	}
+
+	// A burst is capped: the widget is a glance, not the log.
+	for i := 0; i < 10; i++ {
+		id := string(rune('d' + i))
+		tr.note(start(id, "shell", map[string]any{"command": "echo " + id}))
+	}
+	if got := len(tr.snapshot()); got != liveToolLimit {
+		t.Fatalf("snapshot should cap at %d, got %d", liveToolLimit, got)
+	}
+	last := tr.snapshot()[liveToolLimit-1]
+	if last.Status != "running" {
+		t.Errorf("the newest call must survive the cap, got %+v", last)
+	}
+
+	// A card drawn for the widget is one row and carries the running word.
+	lines := RenderLiveToolCards(views, sdk.UITheme{}, 100)
+	if len(lines) != 3 {
+		t.Fatalf("want one row per call, got %d: %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[2], "running") {
+		t.Errorf("the running card should say running: %q", lines[2])
+	}
+	if strings.Contains(lines[0], "running") {
+		t.Errorf("a finished card must not say running: %q", lines[0])
 	}
 }
