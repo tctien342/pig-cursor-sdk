@@ -50,7 +50,7 @@ type Handle struct {
 // Spawn starts the bridge for workspace and waits for the ready line.
 func Spawn(ctx context.Context, bin, workspace string, extraEnv []string, toolCallbackURL, toolCallbackToken string) (*Handle, error) {
 	if bin == "" {
-		return nil, errors.New("bridge binary not found (set CURSOR_SDK_BRIDGE_BIN)")
+		return nil, errors.New("bridge binary not found")
 	}
 	if _, err := os.Stat(bin); err != nil {
 		return nil, fmt.Errorf("bridge binary: %w", err)

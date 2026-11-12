@@ -49,6 +49,12 @@ func (t *turnEmitter) push(ev map[string]any) {
 // events returns every pig event this turn produced, in order.
 func (t *turnEmitter) events() []map[string]any { return t.p.events }
 
+// sawContent reports whether anything visible reached the host yet. A failure
+// before that point is safe to retry.
+func (t *turnEmitter) sawContent() bool {
+	return len(t.p.events) > 1 || len(t.tools) > 0
+}
+
 // text returns the assistant text the turn accumulated.
 func (t *turnEmitter) text() string { return t.p.joinedText() }
 

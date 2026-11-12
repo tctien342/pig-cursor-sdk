@@ -223,7 +223,7 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 	}
 	apiKey := e.resolveAPIKey(ctx, options)
 	if apiKey == "" {
-		e.fail(stream, model, modelID, errors.New("no Cursor API key. Run /login, then choose Use an API key → Cursor."))
+		e.fail(stream, model, modelID, errors.New("no Cursor API key. Run /cursor-login to store one, or set CURSOR_API_KEY. The key comes from cursor.com/dashboard -> API Keys; signing in to Cursor Desktop does not provide it."))
 		return
 	}
 
@@ -259,12 +259,44 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 		return
 	}
 
-	run, err := e.startTurn(ctx, sess, client, apiKey, entry, piCtx, debugStream)
-	if err != nil {
-		e.fail(stream, model, modelID, err)
-		return
+	// One retry, for the case where the agent restored from disk still owns an
+	// upstream run this process cannot release.
+	for attempt := 0; attempt < 2; attempt++ {
+		run, err := e.startTurn(ctx, sess, client, apiKey, entry, piCtx, debugStream)
+		if err != nil {
+			if attempt == 0 && isStaleAgentError(err) {
+				e.resetSession(ctx, sess)
+				continue
+			}
+			e.fail(stream, model, modelID, err)
+			return
+		}
+		if out := e.consume(ctx, stream, model, entry, sess, run, debugStream, piCtx.Tools); out.retry && attempt == 0 {
+			e.resetSession(ctx, sess)
+			continue
+		} else {
+			return
+		}
 	}
-	e.consume(ctx, stream, model, entry, sess, run, debugStream, piCtx.Tools)
+}
+
+// resetSession drops the session's Cursor agent so the next attempt starts from
+// a clean agent and replays the transcript.
+func (e *Engine) resetSession(ctx sdk.Context, sess *Session) {
+	e.mu.Lock()
+	agent := sess.agent
+	sess.agent = nil
+	sess.AgentID = ""
+	sess.pending = nil
+	sess.sentFingerprints = nil
+	sess.overrideSig = ""
+	e.agents.forget(sess.Key)
+	e.mu.Unlock()
+	if agent != nil {
+		if err := agent.Close(goCtx(ctx)); err != nil {
+			e.cfg.Logger.Debug("closing stale cursor agent failed", "err", err)
+		}
+	}
 }
 
 // resumeParked resolves parked host calls from the transcript's tool results
@@ -424,7 +456,12 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 // consume turns run events into pig provider events. This is the display
 // contract: only assistant text, thinking, and real host tool calls reach the
 // transcript.
-func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) {
+// turnOutcome reports whether the caller should retry the turn with a clean
+// session. Only a failure that happens before any content reached the host can
+// be retried, so a retry never duplicates a partially streamed message.
+type turnOutcome struct{ retry bool }
+
+func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) turnOutcome {
 	em := newTurnEmitter(model, entry)
 	em.sink = func(ev map[string]any) { stream.Push(ev) }
 	// Cursor's own tool activity is invisible by design; a footer hint is the
@@ -453,7 +490,7 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 		}
 		if msg, failed := em.statusFailure(ev); failed {
 			e.failWith(stream, em.p, model, errors.New(msg))
-			return
+			return turnOutcome{}
 		}
 		if em.add(ev) {
 			// This turn is over: pig runs the tool and calls back with the result,
@@ -464,14 +501,21 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	}
 
 	if err := run.DrainErr(); err != nil {
+		if isStaleAgentError(err) && !em.sawContent() {
+			// The agent we restored from disk still owns a run upstream that this
+			// process cannot see — typical after an interrupted session. Release it
+			// and let the caller start a clean agent instead of showing an error.
+			e.cfg.Logger.Info("restored cursor agent still holds an upstream run; starting a fresh one", "err", err)
+			return turnOutcome{retry: true}
+		}
 		e.failWith(stream, em.p, model, err)
-		return
+		return turnOutcome{}
 	}
 	if turnCtx.Err() == context.DeadlineExceeded && !run.Finished() {
 		// A wedged upstream must not wedge the host: release the run and say so.
 		_ = run.CancelRun("turn deadline exceeded")
 		e.failWith(stream, em.p, model, fmt.Errorf("Cursor did not respond within %s; the run was released. Try again, or /cursor-abort to clean up.", e.turnDeadline()))
-		return
+		return turnOutcome{}
 	}
 
 	terminal := run.Terminal()
@@ -481,7 +525,7 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 			msg = "Cursor run failed"
 		}
 		e.failWith(stream, em.p, model, errors.New(msg))
-		return
+		return turnOutcome{}
 	}
 
 	reason := "stop"
@@ -497,6 +541,13 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	if debug {
 		e.cfg.Logger.Debug("turn complete", "reason", reason, "events", len(em.events()), "tools", len(em.tools))
 	}
+	return turnOutcome{}
+}
+
+// isStaleAgentError recognises Cursor refusing a send because an agent restored
+// from a previous process still owns a run upstream.
+func isStaleAgentError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "already has active run")
 }
 
 // appendedText reports the new user text when pig's transcript extends what we
@@ -883,9 +934,22 @@ func (e *Engine) fail(stream *sdk.ModelEventStream, model map[string]any, modelI
 	e.cfg.Logger.Error("cursor provider request failed", "model", modelID, "err", err)
 	p := newPartial(model, &ModelEntry{ID: modelID})
 	p.msg["stopReason"] = "error"
-	p.msg["errorMessage"] = err.Error()
-	stream.Push(map[string]any{"type": "error", "reason": cursor.CodeOf(err), "error": p.msg})
+	p.msg["errorMessage"] = e.humanError(err)
+	// reason must be one of pig's stop reasons; the classification belongs in the
+	// message, not in a field the host validates against a fixed set.
+	stream.Push(map[string]any{"type": "error", "reason": "error", "error": p.msg})
 	stream.End(p.msg)
+}
+
+// humanError turns a provider failure into one actionable line. A fresh install
+// is the most likely cause of a startup failure, so it names the path to fix.
+func (e *Engine) humanError(err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "bridge binary not found") {
+		return "Cursor bridge is not installed. Put the cursor-sdk-bridge executable at " +
+			cursor.InstallPath() + " (see the repository README), or point CURSOR_SDK_BRIDGE_BIN at it. Original error: " + msg
+	}
+	return msg
 }
 
 func (e *Engine) failWith(stream *sdk.ModelEventStream, p *partial, model map[string]any, err error) {

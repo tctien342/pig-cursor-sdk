@@ -133,6 +133,10 @@ func bearerAuth(token string) connect.Interceptor { return authInterceptor{token
 // download, then PATH).
 func FindBinary() string { return bridge.FindBinary() }
 
+// InstallPath is where the bridge binary is expected when CURSOR_SDK_BRIDGE_BIN
+// is unset; callers show it in setup instructions.
+func InstallPath() string { return bridge.InstallPath() }
+
 // StateDir is this extension's writable state directory.
 func StateDir() string { return bridge.StateDir() }
 
