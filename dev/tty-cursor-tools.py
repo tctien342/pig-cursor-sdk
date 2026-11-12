@@ -10,7 +10,9 @@ is the reliable way to make the feature visible on demand. Two phases:
 
     dev/tty-cursor-tools.py
 
-Exit 0 means both. The final screen of each phase is printed either way.
+Exit 0 means both, that the line carries a background like a host tool card, and
+that it sits below the turn's message instead of above it. The final screen of each
+phase is printed either way.
 """
 import fcntl
 import json
@@ -77,9 +79,95 @@ class Screen:
     def text(self):
         return "\n".join(self.lines())
 
+    def bg_rows_around(self, needle):
+        """Rows sharing a background colour around the line containing `needle`.
+
+        The card is a band: the empty rows above and below are painted too, so the
+        text sits inside the colour instead of floating in a stripe. Reading the
+        emulated cells is the only way to check that, since it is a property of the
+        colours and not of the characters.
+        """
+        for row, line in enumerate(self.grid.display):
+            if needle not in line:
+                continue
+            band = [row]
+            for direction in (-1, 1):
+                probe = row + direction
+                while 0 <= probe < ROWS:
+                    cells = self.grid.buffer[probe]
+                    painted = any(
+                        cells.get(x) is not None and cells.get(x).bg != "default"
+                        for x in range(1, min(COLS, 70))
+                    )
+                    if not painted:
+                        break
+                    band.append(probe)
+                    probe += direction
+            band.sort()
+            return band
+        return []
+
     def hits(self, pattern):
         rx = re.compile(pattern)
         return [l for l in self.lines() if rx.search(l)]
+
+
+def session_files():
+    root = os.path.expanduser("~/.pig/agent/sessions")
+    found = set()
+    for base, _, names in os.walk(root):
+        for name in names:
+            if name.endswith(".jsonl"):
+                found.add(os.path.join(base, name))
+    return found
+
+
+def order_in_session(path):
+    """Return (assistant index, entry index) of the turn's message and its first
+    Cursor-tool entry, or None.
+
+    The line has to sit below the message it belongs to. pig appends an entry the
+    moment it is asked to and commits the turn's message at the end, so anything
+    written while the turn streams lands above the thinking and text it was
+    interleaved with — which reads as tools firing inside a thought.
+    """
+    rows = []
+    try:
+        with open(path) as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    doc = json.loads(line)
+                except ValueError:
+                    continue
+                rows.append(doc)
+    except OSError:
+        return None
+    assistant = entry = None
+    for i, doc in enumerate(rows):
+        if doc.get("customType") == "cursor-tool" and entry is None:
+            entry = i
+        message = doc.get("message") or {}
+        if doc.get("type") == "message" and message.get("role") == "assistant":
+            assistant = i
+    if assistant is None or entry is None:
+        return None
+    return assistant, entry
+
+
+def theme_has_background(log):
+    """Whether the running theme actually gives a tool card a background.
+
+    The extension logs what the theme hands it, once per process. A theme that maps
+    the card colour to the terminal default has nothing to draw, and that is the
+    theme's choice, not a rendering bug.
+    """
+    probe = re.findall(r'msg="cursor tool theme probe".*?toolSuccessBg="([^"]*)"', log)
+    if not probe:
+        return True  # no probe line: assume the card should have been coloured
+    return "48" in probe[-1]
 
 
 def draw_after_reopen():
@@ -98,7 +186,7 @@ def draw_after_reopen():
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(ROOT)
-        os.execvpe("pig", ["pig", "-e", ".", "--continue"], env)
+        os.execvpe("pig", ["pig", "-e", ".", "--continue", "--use-theme", "dark"], env)
         os._exit(127)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     screen = Screen()
@@ -144,13 +232,14 @@ def main():
     env = dict(os.environ, CURSOR_API_KEY=key, TERM="xterm-256color", PI_CURSOR_GO_DEBUG="1")
     offset = log_size()
     before = bridge_pids()
+    files_before = session_files()
     raw = open(RAW, "wb")
 
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(ROOT)
         # No host tools: Cursor can only use its own, which is what this displays.
-        os.execvpe("pig", ["pig", "-e", ".", "--model", MODEL, "--no-tools", PROMPT], env)
+        os.execvpe("pig", ["pig", "-e", ".", "--model", MODEL, "--no-tools", "--use-theme", "dark", PROMPT], env)
         os._exit(127)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
@@ -204,6 +293,38 @@ def main():
             failures.append("no Cursor-tool line reached the screen")
         if cards and not any("ls -1" in c for c in cards):
             failures.append("the line does not say what was run (expected the command)")
+
+        # A tool line reads as a tool call because the host's tool colours are on
+        # it, background included.
+        # And the card is a band of one colour: blank row, the line, blank row.
+        # This reads the emulated cells rather than the byte stream, because the
+        # claim is about colours on screen, not about escapes that were written.
+        if cards:
+            band = screen.bg_rows_around("◇ cursor:")
+            if theme_has_background(log_since(offset)):
+                if len(band) >= 3:
+                    print(f"card band: rows {band[0]}-{band[-1]} ({len(band)} painted rows)")
+                else:
+                    failures.append(f"the card is not a band of painted rows, found rows {band}")
+            elif band:
+                failures.append(f"the card is painted although the theme defines no card colour: rows {band}")
+            else:
+                print("background: skipped, this theme resolves the card colour to the terminal default")
+
+        # And it reads in the right place: below the turn's message, not above it.
+        new_files = sorted(session_files() - files_before, key=os.path.getmtime)
+        if not new_files:
+            failures.append("no session file was written, so position cannot be checked")
+        else:
+            order = order_in_session(new_files[-1])
+            if order is None:
+                failures.append("session file holds no assistant message or no cursor-tool entry")
+            elif order[1] < order[0]:
+                failures.append(
+                    f"cursor-tool entry (row {order[1]}) is above the assistant message (row {order[0]})"
+                )
+            else:
+                print(f"position: entry row {order[1]} after assistant row {order[0]}")
 
         # ctrl+o is pig's expand: the arguments each call ran with.
         if cards:

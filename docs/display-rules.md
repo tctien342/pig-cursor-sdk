@@ -82,6 +82,31 @@ with ctrl+o expanding the arguments it ran with:
    timeout: 30000
 ```
 
+### It is drawn as a card, in the host's own colours
+
+Each call gets the background pig gives a tool card that ended the same way —
+`toolSuccessBg`, `toolErrorBg`, `toolPendingBg` — and the card is a **band of three
+painted rows**: an empty row, the line, an empty row, all in that colour, so the
+text sits inside the colour instead of floating in a stripe. Padding outside the
+colour would just be space; padding inside it is what makes one call read as one
+card, which matters most when a turn fires a burst of them.
+
+A theme is allowed to map those tokens to the terminal default, in which case
+there is no band to draw and nothing else changes; the extension logs that once per
+process (`cursor tool card has no background in this theme`) because the difference
+between "no colour" and "no card" is otherwise invisible.
+
+### It is written after the message it belongs to
+
+The entries are appended once the turn's assistant message has been committed,
+never while it streams. pig writes an entry the moment it is asked to and commits
+the message at the end of the turn, so anything written mid-turn lands **above** the
+thinking and text it was interleaved with. In a real session that showed fourteen
+shell calls stacked over a message describing them, which reads as tools firing
+inside a thought. Below the message they read as what they are: that turn's
+activity, in call order. A turn that ends before retrying writes nothing — its
+retry reports its own calls.
+
 Why an entry and not a provider event or a message:
 
 - a custom entry is **not model context** (session-format: "It does not become
@@ -110,10 +135,16 @@ activity is never silently invisible.
 | one line, never wrapped, outcome survives a narrow terminal | `TestCursorToolLineStaysOneLineAndKeepsItsOutcome` |
 | expanded view adds the arguments | `TestCursorToolExpandedAddsArguments` |
 | a rejected entry must not fail the turn | `TestTrackerSurvivesARejectedEntry` |
+| nothing is written until the message is committed | `TestTrackerWritesNothingUntilTheTurnIsCommitted` |
+| the band is painted blank row, line, blank row | `TestCursorToolCardPadsInsideTheBackground`, `TestPaintCursorToolLineFillsTheWidth` |
+| the band colour follows the outcome | `TestCursorToolBackgroundMatchesOutcome` |
 
 Live proof: `dev/tty-cursor-tools.py` — runs a turn with no host tools advertised
-(so Cursor can only use its own), asserts the line is on the real screen, that
-ctrl+o expands it, and that reopening the session draws it again from the entry.
+(so Cursor can only use its own), asserts the line is on the real screen, that the
+three rows of the card share a background **as cells on the emulated screen** (not
+as escape codes that were merely written), that ctrl+o expands it, that the entry
+sits below its message in the session file, and that reopening the session draws it
+again from the entry.
 
 ## A batch of tool calls is one turn
 

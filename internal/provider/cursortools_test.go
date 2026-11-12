@@ -180,6 +180,7 @@ func TestTrackerWritesOneEntryPerCall(t *testing.T) {
 	}
 	tr2.note(start("call_c", "shell"))
 	tr2.note(done("call_c", "shell", "error", true))
+	tr2.finish()
 	if len(written) != 1 || firstString(written[0], "status") != "failed" {
 		t.Fatalf("failed call stored as %v, want status failed", written)
 	}
@@ -190,6 +191,100 @@ func TestTrackerWritesOneEntryPerCall(t *testing.T) {
 	line := cursorToolLines(card, colorIdentity, false, 110)[0]
 	if !strings.Contains(line, "failed") {
 		t.Errorf("rendered failed call = %q", line)
+	}
+}
+
+// The lines are written once the assistant message is committed, never during the
+// turn: pig appends an entry immediately and commits the message at the end, so a
+// line written mid-turn lands above the thinking and text it was interleaved with.
+func TestTrackerWritesNothingUntilTheTurnIsCommitted(t *testing.T) {
+	var written []map[string]any
+	tr := &cursorToolTracker{
+		appendEntry: func(data map[string]any) error { written = append(written, data); return nil },
+		log:         discardLogger(),
+		calls:       map[string]*cursorToolCall{},
+		wrote:       map[string]bool{},
+	}
+	tr.note(cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolStarted,
+		ToolCall: &cursor.ToolCallEvent{ID: "a", ToolName: "shell", Status: "running"}}})
+	tr.note(cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolCompleted,
+		ToolCall: &cursor.ToolCallEvent{ID: "a", ToolName: "shell", Status: "completed"}}})
+	if len(written) != 0 {
+		t.Fatalf("a call must not be written while the turn is streaming, got %v", written)
+	}
+	tr.finish()
+	if len(written) != 1 {
+		t.Fatalf("finish should write the finished call, got %v", written)
+	}
+	tr.finish()
+	if len(written) != 1 {
+		t.Fatalf("finish must not write a call twice, got %v", written)
+	}
+}
+
+// A tool line carries its outcome's background, filled to the full width like a
+// host tool card.
+func TestPaintCursorToolLineFillsTheWidth(t *testing.T) {
+	paint := func(text string) string { return "[" + text + "]" }
+	got := paintCursorToolLine("ab", 10, paint)
+	if got != "[ab        ]" {
+		t.Fatalf("line should be padded to width and painted, got %q", got)
+	}
+	if got := paintCursorToolLine("exactly-1234", 12, paint); got != "[exactly-1234]" {
+		t.Fatalf("exact width = %q", got)
+	}
+	if got := paintCursorToolLine("way-too-long-for-this-terminal", 10, paint); got != "[way-too-long-for-this-terminal]" {
+		t.Fatalf("overlong line = %q", got)
+	}
+	if got := paintCursorToolLine("x", 10, nil); got != "x" {
+		t.Fatalf("no painter should leave the line alone, got %q", got)
+	}
+	// The card's empty rows carry the colour too, so the band is what has height.
+	if got := paintCursorToolLine("", 6, paint); got != "[      ]" {
+		t.Fatalf("empty row should be painted to the full width, got %q", got)
+	}
+}
+
+// The card is drawn as a band: painted blank row, line, painted blank row — the
+// padding is inside the colour, not outside it.
+func TestCursorToolCardPadsInsideTheBackground(t *testing.T) {
+	lines := withCardPadding(cursorToolLines(cursorToolCard{tool: "shell", status: "completed"}, colorIdentity, false, 40))
+	if len(lines) != 3 || lines[0] != "" || lines[2] != "" {
+		t.Fatalf("want blank, line, blank before painting, got %q", lines)
+	}
+	painted := make([]string, 0, len(lines))
+	for _, line := range lines {
+		painted = append(painted, paintCursorToolLine(line, 40, func(text string) string { return "<" + text + ">" }))
+	}
+	for i, line := range painted {
+		if !strings.HasPrefix(line, "<") || !strings.HasSuffix(line, ">") {
+			t.Fatalf("row %d is outside the colour band: %q", i, line)
+		}
+	}
+}
+
+// A card sits alone: an empty line above and below, so nine calls in a row still
+// read as nine tool calls.
+func TestCursorToolCardIsPadded(t *testing.T) {
+	got := withCardPadding([]string{"◇ cursor: shell · ls -1"})
+	if len(got) != 3 || got[0] != "" || got[2] != "" || got[1] == "" {
+		t.Fatalf("want blank line, card, blank line, got %q", got)
+	}
+	if empty := withCardPadding(nil); len(empty) != 0 {
+		t.Fatalf("nothing to draw should stay nothing, got %q", empty)
+	}
+}
+
+// Each outcome takes the colour the host gives a tool card that ended that way.
+func TestCursorToolBackgroundMatchesOutcome(t *testing.T) {
+	for status, want := range map[string]string{
+		"completed":  "toolSuccessBg",
+		"failed":     "toolErrorBg",
+		"unfinished": "toolPendingBg",
+	} {
+		if got := (cursorToolCard{status: status}).backgroundToken(); got != want {
+			t.Errorf("status %q -> %q, want %q", status, got, want)
+		}
 	}
 }
 

@@ -272,6 +272,9 @@ func (s *state) configure(ctx sdk.Context) {
 		Mode:           s.mode,
 		Logger:         newLogger(),
 	}
+	// The Cursor-tool renderer is a plain function with no config; this is the
+	// point where a logger exists to hand it.
+	provider.SetToolEntryLogger(s.cfg.Logger)
 	s.rebuildEngineLocked()
 	s.mu.Unlock()
 }

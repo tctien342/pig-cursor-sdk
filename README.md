@@ -202,9 +202,12 @@ line itself:
    command: grep -rn deferPlanWork .        # ctrl+o for the arguments
 ```
 
-One line per call, written when the call ends, drawn from a custom session entry
-that is never model context — so the model is never shown another agent's tool
-traces, and a resumed session still redraws them.
+One line per call, drawn as a card in pig's own tool-card colours — the background
+band covers an empty row, the line, and an empty row, so calls in a burst read as
+separate calls. Written after the turn's message is committed, never while it
+streams, so a call is never drawn above the thinking it happened inside. It comes
+from a custom session entry, which is never model context: the model is not shown
+another agent's tool traces, and a resumed session redraws the same lines.
 
 The run parks on an open bridge callback while pig runs the tool; the callback is
 resolved exactly once from the next request's `toolResult`, and the run continues

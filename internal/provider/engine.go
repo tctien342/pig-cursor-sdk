@@ -795,7 +795,7 @@ type turnOutcome struct {
 	recover bool
 }
 
-func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) turnOutcome {
+func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) (outcome turnOutcome) {
 	em := newTurnEmitter(model, entry)
 	em.sink = func(ev map[string]any) { stream.Push(ev) }
 	em.hostToolSet = toolNameSet(tools)
@@ -807,6 +807,16 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	if cursorToolsDisabled() || !ctx.HasUI() {
 		ct = nil
 	}
+	// Written after the message, on every path that keeps the turn: see
+	// cursorToolTracker.finish. A retried turn reports its own calls, so its
+	// discarded attempt writes nothing.
+	defer func() {
+		if ct == nil || outcome.retry || outcome.recover {
+			return
+		}
+		ct.finish()
+		ctx.ClearStatus("cursor-activity")
+	}()
 
 	em.begin()
 
@@ -902,10 +912,6 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	reason := "stop"
 	if terminal != nil && terminal.Status == "CANCELLED" {
 		reason = "aborted"
-	}
-	if ct != nil {
-		ct.finish()
-		ctx.ClearStatus("cursor-activity")
 	}
 	reason = em.finish(reason, terminal)
 	sess.lastUsage = em.p.usage

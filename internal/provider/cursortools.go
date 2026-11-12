@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -96,24 +97,59 @@ func (t *cursorToolTracker) note(ev cursor.RunEvent) {
 		if len(call.args) == 0 {
 			call.args = ev.ToolCall.Args
 		}
-		t.write(call)
 	}
 }
 
-// finish writes a line for every call that never reported a result, which is what
-// an interrupted or abandoned turn leaves behind. Staying silent there would hide
-// exactly the case worth seeing.
+// finish writes the transcript lines for the turn, in call order.
+//
+// It is called once, after the assistant message has been committed — never while
+// the turn is still streaming. pig appends a session entry the moment it is asked
+// to, and commits the turn's message at the end of the turn, so an entry written
+// mid-turn lands *above* the thinking and text it was interleaved with. A real
+// session showed nine shell calls stacked over a message that described them,
+// which reads as tools running in the middle of a thought. Below the message they
+// read as what they are: the activity of that turn, in order.
+//
+// Calls that never reported a result are written as "no result" rather than
+// dropped: an interrupted turn is exactly the case worth seeing.
 func (t *cursorToolTracker) finish() {
 	if t == nil {
 		return
 	}
 	for _, id := range t.order {
 		call := t.calls[id]
-		if !call.finished {
+		if !call.finished && call.endedAt.IsZero() {
 			call.endedAt = time.Now()
-			t.write(call)
 		}
+		t.write(call)
 	}
+}
+
+// backgroundToken is the theme token whose colour the host gives a tool card with
+// the same outcome, so a Cursor-side line is read as a tool call and not as prose.
+func (c cursorToolCard) backgroundToken() string {
+	switch c.status {
+	case "failed":
+		return "toolErrorBg"
+	case "unfinished":
+		return "toolPendingBg"
+	default:
+		return "toolSuccessBg"
+	}
+}
+
+// paintCursorToolLine fills the line's background across the full width, the way
+// a host tool card does. bg paints one already-coloured run; a line wider than
+// the terminal is passed through unpadded rather than truncated, because the
+// layout rules above are what decide what a line contains.
+func paintCursorToolLine(line string, width int, bg func(string) string) string {
+	if bg == nil {
+		return line
+	}
+	if room := width - runeWidth(line); room > 0 {
+		line += strings.Repeat(" ", room)
+	}
+	return bg(line)
 }
 
 func (t *cursorToolTracker) write(call *cursorToolCall) {
@@ -500,6 +536,36 @@ func clipVisible(s string, max int) string {
 	return b.String()
 }
 
+// toolEntryLog is set by the extension factory: the renderer is registered as a
+// plain function and has no config of its own, so a question like "does this
+// theme even define a background token" cannot be answered without it.
+var toolEntryLog *slog.Logger
+
+// SetToolEntryLogger installs that logger.
+func SetToolEntryLogger(l *slog.Logger) { toolEntryLog = l }
+
+var themeProbeOnce sync.Once
+
+// probeThemeOnce logs, once per process, which background tokens the running
+// theme defines. A missing token silently drops the card background, which is a
+// display change nobody would notice until they asked why.
+func probeThemeOnce(theme sdk.UITheme) {
+	if toolEntryLog == nil {
+		return
+	}
+	themeProbeOnce.Do(func() {
+		var found []string
+		for name := range theme.Colors() {
+			if strings.HasSuffix(name, "Bg") {
+				found = append(found, name)
+			}
+		}
+		sort.Strings(found)
+		sgr, err := theme.GetBgAnsi("toolSuccessBg")
+		toolEntryLog.Debug("cursor tool theme probe", "mode", theme.GetColorMode(), "bgTokens", strings.Join(found, ","), "toolSuccessBg", sgr, "err", err)
+	})
+}
+
 // RenderCursorToolEntry is the host-facing renderer for a Cursor-side tool line.
 // It is registered by the extension factory, so a resumed session draws its
 // history in the same shape it was written in.
@@ -509,13 +575,44 @@ func RenderCursorToolEntry(ctx sdk.Context, entry map[string]any, opts sdk.Entry
 		return nil, nil
 	}
 	theme := ctx.UITheme()
+	probeThemeOnce(theme)
 	color := func(token, text string) string {
 		if text == "" {
 			return ""
 		}
 		return theme.Fg(token, text)
 	}
-	return cursorToolLines(card, color, opts.Expanded, width), nil
+	// Padded first, painted second: the empty rows are part of the card, so the
+	// band of colour covers them too and the text sits inside it, the way a host
+	// tool card does.
+	lines := withCardPadding(cursorToolLines(card, color, opts.Expanded, width))
+	token := card.backgroundToken()
+	if ansi, err := theme.GetBgAnsi(token); err == nil && strings.Contains(ansi, "48") {
+		paint := func(text string) string { return theme.Bg(token, text) }
+		for i, line := range lines {
+			lines[i] = paintCursorToolLine(line, width, paint)
+		}
+	} else if err == nil && toolEntryLog != nil {
+		// The theme resolves this outcome's background to the terminal default, so
+		// there is no band to draw. Worth one log line: the difference between "no
+		// colour" and "no card" is otherwise invisible.
+		toolEntryLog.Debug("cursor tool card has no background in this theme", "token", token, "ansi", ansi)
+	}
+	return lines, nil
+}
+
+// withCardPadding adds the empty rows a card is drawn with, above and below. They
+// are painted like the rest of the card, so the colour band is three rows tall and
+// the text is inside it rather than floating in a stripe. Between calls the padding
+// is also what keeps a burst of Cursor tools from rendering as one dense block.
+func withCardPadding(lines []string) []string {
+	if len(lines) == 0 {
+		return lines
+	}
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, "")
+	out = append(out, lines...)
+	return append(out, "")
 }
 
 // cursorToolHint is the live footer line for a call still running. It is the only
