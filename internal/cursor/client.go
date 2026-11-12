@@ -201,6 +201,42 @@ func (c *Client) Models(ctx context.Context, apiKey string) ([]*sdkpb.SdkModel, 
 	return res.Msg.GetItems(), nil
 }
 
+// UsageReport is Cursor's billing view of one agent, in plain Go types so the
+// provider layer never touches protobuf.
+type UsageReport struct {
+	Tokens    Usage   // input/output/cache/reasoning/total
+	CostCents float64 // charged when Cursor reports it, otherwise raw model cost
+	CostLabel string  // "charged" | "raw" | "" (not reported)
+	Runs      int
+}
+
+// Usage returns Cursor's own totals for one agent. Cost is server-derived and
+// eventually consistent after a run ends, so an empty CostLabel means "not
+// reported yet", not free.
+func (c *Client) Usage(ctx context.Context, agentID string) (*UsageReport, error) {
+	res, err := c.Agent.GetUsage(ctx, connect.NewRequest(&sdkpb.GetUsageRequest{AgentId: agentID}))
+	if err != nil {
+		return nil, err
+	}
+	au := res.Msg.GetUsage()
+	if au == nil {
+		return nil, nil
+	}
+	out := &UsageReport{Runs: len(au.GetRuns())}
+	if u := au.GetUsage(); u != nil {
+		out.Tokens = *convertUsage(u)
+	}
+	if cost := au.GetCost(); cost != nil {
+		switch {
+		case cost.GetChargedCents() > 0:
+			out.CostCents, out.CostLabel = cost.GetChargedCents(), "charged"
+		case cost.GetRawCostCents() > 0:
+			out.CostCents, out.CostLabel = cost.GetRawCostCents(), "raw"
+		}
+	}
+	return out, nil
+}
+
 // Tools returns the callback registration surface.
 func (c *Client) Tools() *ToolCallbacks { return &ToolCallbacks{cb: c.callbacks} }
 

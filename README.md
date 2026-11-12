@@ -79,7 +79,8 @@ maps onto the model's own reasoning parameter.
 | `/cursor-refresh-models` | re-read the catalog through the bridge, cache it, re-register |
 | `/cursor-mode plan\|agent` | Cursor plan mode vs agent mode |
 | `/cursor-abort` | release the Cursor run live in *this* pig process (completed host work is not undone) |
-| `/cursor-status` | bridge pid, catalog size, mode, key presence, tool mode |
+| `/cursor-usage` | tokens and cost Cursor reports for this session's agents |
+| `/cursor-status` | bridge pid, catalog size, mode, key presence, tool mode, usage |
 | `/cursor-login` | store an API key |
 
 Environment: `CURSOR_SDK_BRIDGE_BIN` (bridge path), `PI_CURSOR_TURN_TIMEOUT`
@@ -87,6 +88,28 @@ Environment: `CURSOR_SDK_BRIDGE_BIN` (bridge path), `PI_CURSOR_TURN_TIMEOUT`
 host tool call to catch a batched turn, default `900`), `PI_CURSOR_GO_DEBUG=1`
 (debug logging to `~/.pig/agent/pig-cursor-sdk/agent.log`),
 `PI_CURSOR_SETTING_SOURCES`, `PI_CURSOR_FOOTER=0`.
+
+## Usage in the footer
+
+The status line carries what the account has spent, refreshed when a turn ends
+(never polled, and never on the request path — a slow usage RPC cannot delay an
+answer):
+
+```text
+cursor · grok-4.7 · 24.1k tok · $0.31 · pid 41821
+```
+
+Numbers come from Cursor's own `GetUsage` for the agents this extension created:
+token totals plus cost in cents, shown as charged when Cursor reports a charged
+amount and as `… raw` when it only reports undiscounted model cost (plan-included,
+BYOK, and grant accounts report no charged figure, so the label matters).
+`/cursor-usage` gives the in/out/reasoning split and the run count.
+
+Scope, stated plainly because the protocol sets the limit: `sdk.v1` exposes usage
+per agent and no account-wide usage or plan-limit RPC (`SdkCursorService` has only
+`Me`, `ListModels`, `ListRepositories`). So the footer reads *what these agents
+consumed*, not *what the plan allows*. A fallback covers the case where the usage
+RPC is unavailable: the run's own usage frame, which has tokens but no cost.
 
 ## How tool calls are displayed
 

@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	sdkpb "github.com/tctien342/pig-cursor-sdk/gen/sdk/v1"
 	cursor "github.com/tctien342/pig-cursor-sdk/internal/cursor"
@@ -40,3 +42,44 @@ func newLogger() *slog.Logger {
 func bridgeInstallDir() string { return cursor.StateDir() }
 
 func bridgeInstallPathShim() string { return cursor.FindBinary() }
+
+// formatTokens keeps the footer compact: 1234 → 1.2k, 12_345_678 → 12.3M.
+func formatTokens(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		return trimFloat(float64(n)/1_000_000) + "M"
+	case n >= 1_000:
+		return trimFloat(float64(n)/1_000) + "k"
+	default:
+		return strconv.FormatInt(n, 10)
+	}
+}
+
+func trimFloat(v float64) string {
+	s := strconv.FormatFloat(v, 'f', 1, 64)
+	return strings.TrimSuffix(s, ".0")
+}
+
+// money renders dollars with at most two decimals and no trailing zeros, because
+// Cursor reports cents and a single decimal would round $0.04 up to $0.0.
+func money(v float64) string {
+	s := strconv.FormatFloat(v, 'f', 2, 64)
+	s = strings.TrimSuffix(s, "0")
+	s = strings.TrimSuffix(s, ".0")
+	return strings.TrimSuffix(s, ".")
+}
+
+// formatCost renders Cursor's cost report. Cursor reports cents; "raw" means the
+// undiscounted model cost because the account reports no charged amount (plan
+// -included, BYOK, or grant usage), which the footer marks so the number is not
+// read as a bill.
+func formatCost(cents float64, label string) string {
+	if cents <= 0 {
+		return ""
+	}
+	dollars := "$" + money(cents/100)
+	if label == "raw" {
+		dollars += " raw"
+	}
+	return dollars
+}

@@ -13,6 +13,9 @@ import os, pty, re, select, subprocess, sys, time
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 model = sys.argv[1] if len(sys.argv) > 1 else "cursor/grok-4.7"
 prompt = sys.argv[2] if len(sys.argv) > 2 else "Use the bash tool to run exactly: echo tty-check. Then tell me what printed."
+# After the turn settles we ask for the usage readout, so one capture shows both
+# the footer line and what /cursor-usage prints.
+followups = ["/cursor-usage", "/cursor-status"]
 
 key = None
 try:
@@ -29,9 +32,10 @@ if pid == 0:
     os.execvpe(cmd[0], cmd, env)
 
 buf = b""
-deadline = time.time() + 240
+deadline = time.time() + 300
 sent = False
 last_input = time.time()
+queue = list(followups)
 while time.time() < deadline:
     r, _, _ = select.select([fd], [], [], 0.5)
     if r:
@@ -47,7 +51,13 @@ while time.time() < deadline:
         if not sent and time.time() - last_input > 3:
             # the first prompt was passed on the command line; give the run time
             sent = True
-        if sent and time.time() - last_input > 25:
+        if queue and sent and time.time() - last_input > 6:
+            cmd = queue.pop(0).encode() + b"\r"
+            os.write(fd, cmd)
+            last_input = time.time()
+            time.sleep(4)  # let the readout render before the next one
+            continue
+        if sent and not queue and time.time() - last_input > 20:
             break
 try:
     os.write(fd, b"\x03")  # Ctrl+C: interrupt whatever is running

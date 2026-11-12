@@ -114,11 +114,50 @@ func Extension() *sdk.Extension {
 		if k := st.apiKey(ctx); k != "" {
 			key = "set"
 		}
-		ctx.Notify(strings.Join([]string{
+		lines := []string{
 			fmt.Sprintf("bridge: %s (pid %d)", orNone(bin), pid),
 			fmt.Sprintf("catalog: %d models · mode %s · key %s", models, mode, key),
 			"tools: host tools — pig executes and renders them natively",
-		}, "\n"), "info")
+		}
+		if l := usageLine(st.engineRef()); l != "" {
+			lines = append(lines, l)
+		}
+		ctx.Notify(strings.Join(lines, "\n"), "info")
+		return nil
+	})
+
+	// Usage is server-side and only settles after a run ends, so the footer is
+	// refreshed when a turn finishes rather than polled.
+	e.OnEvent("turn_end", func(ctx sdk.Context, _ map[string]any) (any, error) {
+		st.refreshStatus(ctx)
+		return nil, nil
+	})
+
+	e.Command("cursor-usage", "Show Cursor token and cost usage for this session.", func(ctx sdk.Context, args string) error {
+		eng := st.engineRef()
+		if eng == nil {
+			ctx.Notify("cursor: no active session yet (start a turn, then ask again)", "info")
+			return nil
+		}
+		u := eng.Reported()
+		if !u.Reported {
+			ctx.Notify("cursor: no usage reported yet — finish a turn first", "info")
+			return nil
+		}
+		lines := []string{fmt.Sprintf("tokens: %s total (%s in · %s out",
+			formatTokens(u.TotalTokens), formatTokens(u.InputTokens), formatTokens(u.OutputTokens))}
+		if u.Reasoning > 0 {
+			lines[0] += fmt.Sprintf(" · %s reasoning", formatTokens(u.Reasoning))
+		}
+		lines[0] += ")"
+		if c := formatCost(u.CostCents, u.CostLabel); c != "" {
+			lines = append(lines, fmt.Sprintf("cost: %s (%s, %d run%s reported by Cursor)",
+				c, u.CostLabel, u.Runs, plural(u.Runs)))
+		} else {
+			lines = append(lines, "cost: not reported by Cursor for this account")
+		}
+		lines = append(lines, "scope: the Cursor agents this pig session created — Cursor exposes no account-wide usage API")
+		ctx.Notify(strings.Join(lines, "\n"), "info")
 		return nil
 	})
 
@@ -456,6 +495,13 @@ func writeCatalog(path string, items []*ModelItem) error {
 	return os.WriteFile(path, raw, 0o600)
 }
 
+// engineRef returns the live engine without blocking the caller.
+func (s *state) engineRef() *provider.Engine {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.engine
+}
+
 // ---- status ---------------------------------------------------------------
 
 // refreshStatus keeps one compact footer line. Cursor signals belong in the
@@ -483,6 +529,16 @@ func (s *state) refreshStatus(ctx sdk.Context) {
 	if pid > 0 {
 		parts = append(parts, fmt.Sprintf("pid %d", pid))
 	}
+	if eng := s.engineRef(); eng != nil {
+		if u := eng.Reported(); u.Reported {
+			if u.TotalTokens > 0 {
+				parts = append(parts, formatTokens(u.TotalTokens)+" tok")
+			}
+			if c := formatCost(u.CostCents, u.CostLabel); c != "" {
+				parts = append(parts, c)
+			}
+		}
+	}
 	ctx.SetStatus(statusKey, strings.Join(parts, " · "))
 }
 
@@ -501,4 +557,27 @@ func orNone(s string) string {
 		return "not found (set CURSOR_SDK_BRIDGE_BIN)"
 	}
 	return filepath.Base(s)
+}
+
+// usageLine is the status command's usage row; empty when nothing is reported.
+func usageLine(eng *provider.Engine) string {
+	if eng == nil {
+		return ""
+	}
+	u := eng.Reported()
+	if !u.Reported {
+		return "usage: not reported yet"
+	}
+	line := fmt.Sprintf("usage: %s tokens · %d runs", formatTokens(u.TotalTokens), u.Runs)
+	if c := formatCost(u.CostCents, u.CostLabel); c != "" {
+		line += " · " + c + " (" + u.CostLabel + ")"
+	}
+	return line
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }

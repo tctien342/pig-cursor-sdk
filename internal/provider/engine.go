@@ -95,6 +95,10 @@ type Session struct {
 	overrideSig string
 
 	lastUsage *cursor.Usage
+
+	// usage is Cursor's own billing report for this session's agent, refreshed
+	// after each turn. It is what the footer shows.
+	usage UsageTotals
 }
 
 // ModelOverride carries the per-request controls pig exposes (thinking level,
@@ -108,6 +112,103 @@ type ModelOverride struct {
 type pendingRef struct {
 	ID       string
 	ToolName string
+}
+
+// UsageTotals is the account usage this extension can report: Cursor's numbers
+// for the agents it created. Cursor does not expose an account-wide usage RPC, so
+// this is deliberately "what we spent", not "what the plan allows".
+type UsageTotals struct {
+	TotalTokens  int64
+	InputTokens  int64
+	OutputTokens int64
+	Reasoning    int64
+	CostCents    float64
+	CostLabel    string // "charged" | "raw" | ""
+	Runs         int
+	Reported     bool
+}
+
+// clientNow returns the live bridge client, or nil when none has been spawned.
+func (e *Engine) clientNow() *cursor.Client {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.client
+}
+
+// Reported returns the merged usage report across every session this process has
+// driven, for the footer and /cursor-usage.
+func (e *Engine) Reported() UsageTotals {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out UsageTotals
+	for _, s := range e.sessions {
+		if !s.usage.Reported {
+			continue
+		}
+		out.Reported = true
+		out.TotalTokens += s.usage.TotalTokens
+		out.InputTokens += s.usage.InputTokens
+		out.OutputTokens += s.usage.OutputTokens
+		out.Reasoning += s.usage.Reasoning
+		out.CostCents += s.usage.CostCents
+		if out.CostLabel == "" {
+			out.CostLabel = s.usage.CostLabel
+		}
+		out.Runs += s.usage.Runs
+	}
+	return out
+}
+
+// reportUsage records what the turn cost. Cursor's per-agent totals are the
+// authority (they cover every run in the agent); the run's own usage frame is the
+// fallback when that RPC is unavailable, and it has no cost.
+func (e *Engine) reportUsage(ctx sdk.Context, sess *Session, terminal *cursor.RunResult) {
+	var snapshot UsageTotals
+	if u := usageOf(terminal); u != nil {
+		snapshot = UsageTotals{
+			TotalTokens: orInt(u.TotalTokens, u.InputTokens+u.OutputTokens), InputTokens: u.InputTokens,
+			OutputTokens: u.OutputTokens, Reasoning: u.ReasoningTokens, Reported: true, Runs: 1,
+		}
+	}
+
+	client := e.clientNow()
+	if client != nil && sess.AgentID != "" {
+		uctx, cancel := context.WithTimeout(goCtx(ctx), 3*time.Second)
+		defer cancel()
+		rep, err := client.Usage(uctx, sess.AgentID)
+		if err == nil && rep != nil {
+			sess.usage = UsageTotals{
+				TotalTokens:  orInt(rep.Tokens.TotalTokens, rep.Tokens.InputTokens+rep.Tokens.OutputTokens),
+				InputTokens:  rep.Tokens.InputTokens,
+				OutputTokens: rep.Tokens.OutputTokens,
+				Reasoning:    rep.Tokens.ReasoningTokens,
+				CostCents:    rep.CostCents,
+				CostLabel:    rep.CostLabel,
+				Runs:         rep.Runs,
+				Reported:     true,
+			}
+			return
+		} else if err != nil {
+			e.cfg.Logger.Debug("cursor usage report unavailable", "err", err)
+		}
+	}
+	if snapshot.Reported {
+		sess.usage = snapshot
+	}
+}
+
+func usageOf(terminal *cursor.RunResult) *cursor.Usage {
+	if terminal == nil {
+		return nil
+	}
+	return terminal.Usage
+}
+
+func orInt(v int64, fallback int64) int64 {
+	if v != 0 {
+		return v
+	}
+	return fallback
 }
 
 // NewEngine builds an engine; nothing is spawned until the first request.
@@ -559,8 +660,12 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 		sess.pending = em.pending
 	}
 	stream.End(em.p.msg)
+	// Cost accounting runs after the host has its answer: a slow or unsupported
+	// usage RPC must never delay or break a turn.
+	e.reportUsage(ctx, sess, terminal)
 	if debug {
-		e.cfg.Logger.Debug("turn complete", "reason", reason, "events", len(em.events()), "tools", len(em.tools))
+		e.cfg.Logger.Debug("turn complete", "reason", reason, "events", len(em.events()), "tools", len(em.tools),
+			"tokens", sess.usage.TotalTokens, "cents", sess.usage.CostCents)
 	}
 	return turnOutcome{}
 }
