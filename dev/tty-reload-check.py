@@ -46,6 +46,25 @@ def log_size():
         return 0
 
 
+def bridge_pids():
+    """Pids of the Cursor bridge processes this extension spawns.
+
+    pig is killed here rather than exited, so the extension never gets to close
+    its bridge; the run's own bridges are cleaned up at the end instead of
+    accumulating one per run.
+    """
+    out = os.popen("ps -ax -o pid=,command=").read()
+    pids = set()
+    for line in out.splitlines():
+        head = line.split(None, 1)
+        if len(head) == 2 and "cursor-sdk-bridge" in head[1]:
+            try:
+                pids.add(int(head[0]))
+            except ValueError:
+                pass
+    return pids
+
+
 def log_since(offset):
     try:
         with open(LOG, "rb") as f:
@@ -107,6 +126,7 @@ def wait_for(pid, fd, screen, what, predicate, timeout, raw):
 def main():
     env = dict(os.environ, CURSOR_API_KEY=key(), TERM="xterm-256color", PI_CURSOR_GO_DEBUG="1")
     offset = log_size()
+    bridges_before = bridge_pids()
     raw = open(RAW, "wb")
 
     pid, fd = pty.fork()
@@ -191,6 +211,11 @@ def main():
             os.waitpid(pid, 0)
         except Exception:
             pass
+        for bridge in bridge_pids() - bridges_before:
+            try:
+                os.kill(bridge, 9)
+            except Exception:
+                pass
         raw.close()
 
     print(f"capture: {os.path.getsize(RAW)} bytes in {RAW}")
