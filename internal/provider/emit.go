@@ -23,6 +23,7 @@ type turnEmitter struct {
 	pending     []pendingRef
 	hostToolSet map[string]bool
 	cursorTools *cursorToolTracker
+	count       int
 }
 
 func newTurnEmitter(model map[string]any, entry *ModelEntry) *turnEmitter {
@@ -36,9 +37,14 @@ func newTurnEmitter(model map[string]any, entry *ModelEntry) *turnEmitter {
 // emit records the event and forwards it when a sink is attached. Tests read
 // events(); the streaming path attaches a sink that pushes into pig's stream.
 func (t *turnEmitter) emit(ev map[string]any) {
-	t.p.events = append(t.p.events, ev)
+	t.count++
+	frozen := snapshotMap(ev)
 	if t.sink != nil {
-		t.sink(ev)
+		t.sink(frozen)
+	} else {
+		// Tests retain history. Live streams do not retain quadratic copies of
+		// every full partial message after the SDK takes ownership.
+		t.p.events = append(t.p.events, frozen)
 	}
 }
 
@@ -53,7 +59,7 @@ func (t *turnEmitter) events() []map[string]any { return t.p.events }
 // sawContent reports whether anything visible reached the host yet. A failure
 // before that point is safe to retry.
 func (t *turnEmitter) sawContent() bool {
-	return len(t.p.events) > 1 || len(t.tools) > 0
+	return t.count > 1 || len(t.tools) > 0
 }
 
 // text returns the assistant text the turn accumulated.
@@ -136,7 +142,7 @@ func (t *turnEmitter) cursorToolAnnotation(call *cursorToolCall, outcome string)
 	block["textSignature"] = cursorToolTextSignature
 	t.p.textStarted = true
 	t.push(map[string]any{"type": "text_start", "contentIndex": idx})
-	delta := "\n\n" + strings.TrimSpace(line) + "\n\n"
+	delta := "\n\n" + inlineToolMarker + "\n\n" + strings.TrimSpace(line) + "\n\n"
 	t.p.appendText(delta)
 	t.push(map[string]any{"type": "text_delta", "contentIndex": idx, "delta": delta})
 	t.closeText()
@@ -214,7 +220,14 @@ func (t *turnEmitter) finish(reason string, terminal *cursor.RunResult) string {
 	if terminal != nil && terminal.Status == "CANCELLED" {
 		reason = "aborted"
 	}
-	if terminal != nil && terminal.Text != "" && t.p.hasNoText() {
+	remaining := ""
+	if terminal != nil && terminal.Text != "" {
+		shown := t.p.modelText()
+		if strings.HasPrefix(terminal.Text, shown) {
+			remaining = strings.TrimPrefix(terminal.Text, shown)
+		}
+	}
+	if remaining != "" {
 		// The durable stream reports the run's answer on its result frame instead
 		// of replaying deltas, so the text arrives here.
 		idx := t.p.openText()
@@ -222,8 +235,8 @@ func (t *turnEmitter) finish(reason string, terminal *cursor.RunResult) string {
 			t.p.textStarted = true
 			t.push(map[string]any{"type": "text_start", "contentIndex": idx})
 		}
-		t.p.appendText(terminal.Text)
-		t.push(map[string]any{"type": "text_delta", "contentIndex": idx, "delta": terminal.Text})
+		t.p.appendText(remaining)
+		t.push(map[string]any{"type": "text_delta", "contentIndex": idx, "delta": remaining})
 	}
 	t.closeThinking()
 	t.closeText()

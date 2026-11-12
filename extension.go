@@ -55,6 +55,7 @@ type state struct {
 	liveCtx    *sdk.Context // newest context the live widget may read through
 	liveRender func(int) []string
 	liveShown  bool
+	toolTheme  func() sdk.UITheme // palette getter only; no session/host calls in render
 
 	// One background worker does every network read and every host push that a
 	// handler must not wait for. workPending makes repeat turns coalesce instead
@@ -76,6 +77,15 @@ func Extension() *sdk.Extension {
 	// Retain the custom-entry renderer for sessions written by older releases.
 	// New internal-tool annotations are plain inline assistant text.
 	e.EntryRenderer(provider.CursorToolEntryType, provider.RenderCursorToolEntry)
+	e.MarkdownTransformer(func(markdown string, ctx sdk.MarkdownTransformContext) string {
+		st.mu.Lock()
+		theme := st.toolTheme
+		st.mu.Unlock()
+		if theme == nil {
+			return markdown
+		}
+		return provider.StyleInternalToolMarkdown(markdown, ctx, theme())
+	})
 
 	e.Command("cursor-refresh-models", "Refresh the live Cursor model catalog without restarting pig.", func(ctx sdk.Context, args string) error {
 		n, err := st.refreshModels(ctx)
@@ -268,6 +278,7 @@ func (s *state) providerConfig(models []map[string]any) sdk.ProviderConfig {
 func (s *state) configure(ctx sdk.Context) {
 	home, _ := ctx.ConfigHome()
 	s.mu.Lock()
+	s.toolTheme = ctx.UITheme
 	s.cfg = provider.Config{
 		Provider:       providerID,
 		Workspace:      ctx.Cwd(),
@@ -338,6 +349,9 @@ func (s *state) currentMode() string {
 // stream is streamSimple: the whole per-turn path, in Go.
 func (s *state) stream(ctx sdk.Context, model, piContext, options map[string]any) (*sdk.ModelEventStream, error) {
 	eng := s.engineFor(ctx)
+	s.mu.Lock()
+	s.toolTheme = ctx.UITheme
+	s.mu.Unlock()
 	modelID := stringOf(model, "id")
 	s.mu.Lock()
 	ov := provider.ModelOverride{Thinking: thinkingLevel(ctx, options)}

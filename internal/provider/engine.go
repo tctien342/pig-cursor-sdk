@@ -735,9 +735,14 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 
 	agent := sess.agent
 	if agent != nil && sess.toolSig != toolSig {
-		// The tool set changed; the agent's advertised tools must change with it.
-		agent.SetTools(toolSpecs(tools))
-		sess.toolSig = toolSig
+		// SetTools only updates local bookkeeping, not Cursor's registered
+		// schemas. Pending host calls were resumed before startTurn, so this is
+		// the safe boundary to recreate and replay with the actual new tools.
+		e.cfg.Logger.Info("host tool schemas changed; recreating Cursor agent")
+		_ = agent.Close(goCtx(ctx))
+		sess.agent, agent = nil, nil
+		sess.AgentID = ""
+		e.agents.forget(sess.Key)
 	}
 
 	newText, appended := sess.appendedText(piCtx)
@@ -831,8 +836,17 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 
 	em.begin()
 
-	turnCtx, cancelTurn := context.WithTimeout(goCtx(ctx), e.turnDeadline())
+	turnCtx, cancelTurn := context.WithCancel(goCtx(ctx))
 	defer cancelTurn()
+	// An explicit legacy timeout remains a wall cap. By default, bound silence
+	// rather than cancelling a turn that is still producing useful progress.
+	if wall := durationEnv("PI_CURSOR_TURN_TIMEOUT", 0); wall > 0 {
+		var cancelWall context.CancelFunc
+		turnCtx, cancelWall = context.WithTimeout(turnCtx, wall)
+		defer cancelWall()
+	}
+	watch := newActivityWatch(time.Now())
+	timedOut := false
 
 	// A host tool call ends the turn — but Cursor may batch several calls in one
 	// turn, and pig runs every call we hand back. So after the first call keep
@@ -843,14 +857,19 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	for {
 		var ev cursor.RunEvent
 		var ok bool
+		waitCtx, cancelWait := context.WithTimeout(turnCtx, watch.wait(time.Now()))
 		if hosted {
-			ev, ok = run.NextWithin(turnCtx, grace)
+			ev, ok = run.NextWithin(waitCtx, grace)
 		} else {
-			ev, ok = run.Next(turnCtx)
+			ev, ok = run.Next(waitCtx)
 		}
 		if !ok {
+			timedOut = waitCtx.Err() == context.DeadlineExceeded
+			cancelWait()
 			break
 		}
+		cancelWait()
+		watch.note(ev, time.Now())
 		if debug {
 			e.cfg.Logger.Debug("run event", "kind", string(ev.Kind), "bytes", len(ev.Text), "resumed", run.IsResumed())
 		}
@@ -900,10 +919,15 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 		e.failWith(stream, em.p, model, err)
 		return turnOutcome{}
 	}
-	if turnCtx.Err() == context.DeadlineExceeded && !run.Finished() {
-		// A wedged upstream must not wedge the host: release the run and say so.
-		_ = run.CancelRun("turn deadline exceeded")
-		e.failWith(stream, em.p, model, fmt.Errorf("Cursor did not respond within %s; the run was released. Try again, or /cursor-abort to clean up.", e.turnDeadline()))
+	if (timedOut || turnCtx.Err() == context.DeadlineExceeded) && !run.Finished() && !hosted {
+		releaseErr := run.CancelRun("turn activity deadline exceeded")
+		e.failWith(stream, em.p, model, errors.New(watch.timeoutMessage(turnCtx.Err() == context.DeadlineExceeded, releaseErr)))
+		return turnOutcome{}
+	}
+	if turnCtx.Err() == context.Canceled && !hosted && !run.Finished() {
+		_ = run.CancelRun("host cancelled the turn")
+		em.finish("aborted", run.Terminal())
+		stream.End(snapshotMap(em.p.msg))
 		return turnOutcome{}
 	}
 
@@ -926,12 +950,12 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	if len(em.pending) > 0 {
 		sess.pending = em.pending
 	}
-	stream.End(em.p.msg)
+	stream.End(snapshotMap(em.p.msg))
 	// Cost accounting runs after the host has its answer: a slow or unsupported
 	// usage RPC must never delay or break a turn.
 	e.reportUsage(sess, terminal)
 	if debug {
-		e.cfg.Logger.Debug("turn complete", "reason", reason, "events", len(em.events()), "tools", len(em.tools),
+		e.cfg.Logger.Debug("turn complete", "reason", reason, "events", em.count, "tools", len(em.tools),
 			"tokens", sess.usage.TotalTokens, "cents", sess.usage.CostCents)
 	}
 	return turnOutcome{}
@@ -1146,12 +1170,11 @@ func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 // the host cancels the request, and always carries a deadline-free background
 // parent so a completed provider call never cancels the upstream run.
 func goCtx(ctx sdk.Context) context.Context {
-	cancelled, cancel := context.WithCancel(context.Background())
 	done := ctx.Done()
 	if done == nil {
-		cancel()
-		return cancelled
+		return context.Background() // nil Done means uncancellable, not cancelled
 	}
+	cancelled, cancel := context.WithCancel(context.Background())
 	go func() {
 		defer cancel()
 		select {
@@ -1185,9 +1208,11 @@ func toolSpecs(tools []ToolDef) []cursor.ToolSpec {
 
 func toolSignature(tools []ToolDef) string {
 	var b strings.Builder
-	for _, t := range tools {
+	ordered := append([]ToolDef(nil), tools...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
+	for _, t := range ordered {
 		raw, _ := json.Marshal(t.Schema)
-		fmt.Fprintf(&b, "%s:%d;", t.Name, len(raw))
+		fmt.Fprintf(&b, "%q:%q:%s;", t.Name, t.Description, raw)
 	}
 	return fmt.Sprintf("%x", sha256Short(b.String()))
 }
@@ -1310,6 +1335,17 @@ func (p *partial) joinedText() string {
 	return b.String()
 }
 
+func (p *partial) modelText() string {
+	var out strings.Builder
+	for _, raw := range p.content {
+		b, _ := raw.(map[string]any)
+		if firstString(b, "type") == "text" && firstString(b, "textSignature") != cursorToolTextSignature {
+			out.WriteString(firstString(b, "text"))
+		}
+	}
+	return out.String()
+}
+
 func (p *partial) hasNoText() bool {
 	for _, b := range p.content {
 		if m, _ := b.(map[string]any); m != nil && firstString(m, "type") == "text" && firstString(m, "textSignature") != cursorToolTextSignature && firstString(m, "text") != "" {
@@ -1380,8 +1416,8 @@ func (e *Engine) fail(stream *sdk.ModelEventStream, model map[string]any, modelI
 	p.msg["errorMessage"] = e.humanError(err)
 	// reason must be one of pig's stop reasons; the classification belongs in the
 	// message, not in a field the host validates against a fixed set.
-	stream.Push(map[string]any{"type": "error", "reason": "error", "error": p.msg})
-	stream.End(p.msg)
+	stream.Push(snapshotMap(map[string]any{"type": "error", "reason": "error", "error": p.msg}))
+	stream.End(snapshotMap(p.msg))
 }
 
 // noteRate remembers a usage window Cursor attached to a refusal.
@@ -1412,6 +1448,9 @@ func (e *Engine) LimitWindow() *cursor.RateLimit {
 // is the most likely cause of a startup failure, so it names the path to fix.
 func (e *Engine) humanError(err error) string {
 	msg := err.Error()
+	if cursor.IsInterruptedStream(err) {
+		return "Cursor's response stream was interrupted and safe reattachment was unavailable or exhausted. Partial output was kept; the prompt was not resent. Use /cursor-abort before retrying."
+	}
 	if r := cursor.RateOf(err); r != nil {
 		if sum := r.Summary(time.Now()); sum != "" {
 			return msg + " — Cursor usage window: " + sum
@@ -1427,9 +1466,9 @@ func (e *Engine) humanError(err error) string {
 func (e *Engine) failWith(stream *sdk.ModelEventStream, p *partial, model map[string]any, err error) {
 	e.cfg.Logger.Error("cursor run failed", "err", err)
 	p.msg["stopReason"] = "error"
-	p.msg["errorMessage"] = err.Error()
-	stream.Push(map[string]any{"type": "error", "reason": "error", "error": p.msg})
-	stream.End(p.msg)
+	p.msg["errorMessage"] = e.humanError(err)
+	stream.Push(snapshotMap(map[string]any{"type": "error", "reason": "error", "error": p.msg}))
+	stream.End(snapshotMap(p.msg))
 }
 
 // toolNameSet is the set of tool names advertised to Cursor for this turn.
@@ -1444,8 +1483,6 @@ func toolNameSet(tools []ToolDef) map[string]bool {
 	return out
 }
 
-// turnDeadline bounds one provider turn. A Cursor run that stops producing
-// events must not leave pig waiting forever behind a spinner.
 // batchGrace is how long to keep the stream open after a host tool call to catch
 // the rest of a batched turn.
 func (e *Engine) batchGrace() time.Duration {
@@ -1455,15 +1492,6 @@ func (e *Engine) batchGrace() time.Duration {
 		}
 	}
 	return 900 * time.Millisecond
-}
-
-func (e *Engine) turnDeadline() time.Duration {
-	if v := os.Getenv("PI_CURSOR_TURN_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			return d
-		}
-	}
-	return 5 * time.Minute
 }
 
 func (e *Engine) closeText(push func(map[string]any), p *partial) {

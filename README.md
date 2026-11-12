@@ -83,8 +83,9 @@ maps onto the model's own reasoning parameter.
 | `/cursor-status` | bridge pid, catalog size, mode, key presence, tool mode, usage |
 | `/cursor-login` | store an API key |
 
-Environment: `CURSOR_SDK_BRIDGE_BIN` (bridge path), `PI_CURSOR_TURN_TIMEOUT`
-(default `5m`), `PI_CURSOR_TOOL_BATCH_GRACE_MS` (how long to keep reading after a
+Environment: `CURSOR_SDK_BRIDGE_BIN` (bridge path), `PI_CURSOR_IDLE_TIMEOUT`
+(default `5m` without meaningful progress), `PI_CURSOR_TOOL_TIMEOUT` (default `30m`
+for a known running internal tool), `PI_CURSOR_TURN_TIMEOUT` (optional explicit wall cap), `PI_CURSOR_TOOL_BATCH_GRACE_MS` (how long to keep reading after a
 host tool call to catch a batched turn, default `900`), `PI_CURSOR_GO_DEBUG=1`
 (debug logging to `~/.pig/agent/pig-cursor-sdk/agent.log`),
 `PI_CURSOR_SETTING_SOURCES`, `PI_CURSOR_FOOTER=0`, `PI_CURSOR_SHOW_TOOLS=0`.
@@ -205,8 +206,10 @@ Now I'll check the files.
 
 Only the currently running call appears above the editor as a compact hint.
 Completed calls stay inline, never as a list beside the usage bar. New inline
-annotations are ordinary assistant text, without native card backgrounds or
-ctrl+o expansion; they may be visible to other models and compaction. Generated
+annotations remain ordinary assistant text, but a display-only transform gives
+marked internal items pig tool-card backgrounds and padding in place. No ANSI is
+stored, and native pig tool cards are untouched. Internal items have no ctrl+o
+expansion; their text may be visible to other models and compaction. Generated
 blocks have a namespaced text signature so Cursor's replay can omit them without
 removing real assistant prose. Old custom-entry tool cards still redraw on resume.
 
@@ -271,6 +274,8 @@ dev/.venv/bin/python dev/tty-reload-check.py   # chat, /reload, and a turn after
 python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty-session.txt
 ./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
 dev/.venv/bin/python dev/tty-inline-tools.py  # inline order, one running hint, saved metadata and resume
+dev/.venv/bin/python dev/tty-tool-style.py    # offline: internal card padding + native bash card
+dev/.venv/bin/python dev/tty-host-tool.py     # live: pig bash executes and returns a native tool result
 dev/.venv/bin/python dev/tty-two-sessions.py  # sessions in one directory: one exits, the rest survive
 dev/.venv/bin/python dev/tty-interrupt.py    # a message sent while Cursor is working still gets an answer
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
@@ -295,6 +300,9 @@ the hang is in [docs/evidence/tty-reload.txt](docs/evidence/tty-reload.txt).
   comes from Cursor's app API rather than a published contract (see *Plan usage*).
   Rolling 5-hour windows are not exposed by either surface — only the billing
   cycle is.
+- Interrupted streams can reattach to the same run up to twice without resending
+  the prompt. Replayed text must match the displayed prefix; unknown IDs or
+  divergence fail safely. See [stream resilience](docs/resilience.md).
 - Cursor-internal tools are inline text annotations, not executable pig tools.
   They show the command at its event position, not tool output. Other providers
   can see those lines; Cursor replay omits exactly marked display blocks. Disable

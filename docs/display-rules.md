@@ -35,7 +35,8 @@ into pig provider events, so the rules are one place, testable without a bridge.
    pid go to `ctx.SetStatus`; usage comes from Cursor's counters with
    `totalFromProvider: false`, since Cursor reports tokens, not dollars.
 8. **Failures are one readable line.** A bridge or run failure ends the turn with
-   a classified message ("Cursor did not respond within 5m; the run was released"),
+   a classified message distinguishing inactivity, explicit wall limits and
+   unconfirmed cancellation,
    never a stack or a raw payload.
 
 ## UTF-8 fallback
@@ -93,11 +94,16 @@ providers and pig's compaction can see them. Generated blocks carry the exact
 `textSignature: pig-cursor-sdk:internal-tool:v1` marker. Cursor's `ReplayPrompt`
 omits only those marked assistant blocks, preserving user text and lookalike prose.
 These are metadata markers, not a security boundary; other providers or compaction
-may rewrite the blocks and lose the marker.
+may rewrite the blocks and lose the marker. Display styling does not change whether
+a tool executes: only a genuine advertised host toolCall is executable.
 
-There is no native tool-card background or ctrl+o expansion for the new inline
-text. The legacy `cursor-tool` entry renderer remains registered so older sessions
-still redraw their original cards, but new turns do not write those entries.
+The generated block also has a namespaced Markdown comment marker. A display-only
+Markdown transformer styles exactly standalone marked assistant blocks with pig\'s
+tool background, foreground and an empty painted row above and below. Ordinary
+assistant/user Markdown and executable host tool cards are untouched. Stored text
+contains no ANSI. Inline internal items still have no native ctrl+o/output renderer.
+The legacy `cursor-tool` entry renderer remains registered so older sessions redraw
+their original cards, but new turns do not write those entries.
 
 The widget above the editor shows **only one currently running hint**: the newest
 unfinished call. Completed calls never accumulate beside the usage bar. When that

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,7 +109,8 @@ func (a *Agent) Active() *Run {
 	return a.run
 }
 
-// SetTools replaces the advertised host tools for later sends.
+// SetTools updates local bookkeeping only; it does NOT re-register schemas in
+// Cursor. The provider recreates agents at safe turn boundaries when tools change.
 func (a *Agent) SetTools(tools []ToolSpec) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -380,6 +382,13 @@ type Run struct {
 	paused       bool
 
 	usage *Usage
+
+	recoveries                       int
+	recovering                       bool
+	deliveredText, deliveredThinking strings.Builder
+	replayText, replayThinking       string
+	internalSeen                     map[string]bool
+	settled                          map[string]*ParkedCall // callback replies retained for exactly-once replay
 }
 
 const (
@@ -495,7 +504,7 @@ func (r *Run) openBarrierOnCompletion(status string) {
 // extension is meant to remove.
 func (r *Run) suppressed(kind EventKind) bool {
 	r.mu.Lock()
-	resumed, open := r.resumed, r.barrierOpen
+	resumed, open := r.resumed && !r.recovering, r.barrierOpen
 	r.mu.Unlock()
 	if !resumed || open {
 		return false
@@ -550,6 +559,7 @@ func (r *Run) Resume(ctx context.Context) error {
 	// The replay carries the events of the first segment again; text and thinking
 	// stay suppressed until the host call the run parked on reports completion.
 	r.resumed = true
+	r.recovering = false
 	r.paused = false
 	r.queue = newEventQueue(maxQueuedEvents)
 	r.mu.Unlock()
@@ -642,6 +652,10 @@ func (r *Run) ResolveHostCall(id string, payload map[string]any, isError bool, n
 	p.mu.Unlock()
 	close(p.done)
 	delete(r.parked, id)
+	if r.settled == nil {
+		r.settled = map[string]*ParkedCall{}
+	}
+	r.settled[id] = p
 	var rest []string
 	for _, oid := range r.order {
 		if oid != id {
@@ -663,9 +677,11 @@ func (r *Run) CancelRun(reason string) error {
 	runID := r.RunID()
 	r.abandon(errors.New(orString(reason, "cancelled")))
 	if runID == "" {
-		return nil
+		return errors.New("cursor: local run stopped, but upstream cancellation is unavailable without a run ID")
 	}
-	_, err := r.agent.client.Agent.CancelRun(context.Background(), connect.NewRequest(&sdkpb.CancelRunRequest{RunId: runID}))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := r.agent.client.Agent.CancelRun(ctx, connect.NewRequest(&sdkpb.CancelRunRequest{RunId: runID}))
 	return wrapErr("CancelRun", err)
 }
 
@@ -729,9 +745,19 @@ func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, er
 		r.mu.Unlock()
 		return nil, errors.New("cursor: run already ended")
 	}
+	if existing := r.settled[raw]; existing != nil {
+		r.mu.Unlock()
+		if !sameCallback(existing, req) {
+			return nil, errors.New("cursor: callback ID reused with different tool or arguments")
+		}
+		return r.copyResult(existing)
+	}
 	if existing, ok := r.parked[raw]; ok {
 		// A duplicate callback for the same call id must not run the tool twice.
 		r.mu.Unlock()
+		if !sameCallback(existing, req) {
+			return nil, errors.New("cursor: callback ID reused with different tool or arguments")
+		}
 		if res, err2, done := existing.Settled(); done {
 			return res, err2
 		}
@@ -812,99 +838,117 @@ func (r *Run) copyResult(p *ParkedCall) (map[string]any, error) {
 // drain reads the run stream until it ends. It never blocks on a provider
 // turn: events queue, and a provider that stops consuming cannot stall the run.
 func (r *Run) drain(stream *connect.ServerStreamForClient[sdkpb.RunStreamMessage]) {
-	defer stream.Close()
-	for stream.Receive() {
-		r.noteOffset(stream.Msg())
-		for _, ev := range Decode(stream.Msg(), true) {
-			if ev.RunID != "" || ev.AgentID != "" {
-				r.mu.Lock()
-				if r.runID == "" {
-					r.runID = ev.RunID
+	defer func() { _ = stream.Close() }()
+	for {
+		for stream.Receive() {
+			r.noteOffset(stream.Msg())
+			for _, ev := range Decode(stream.Msg(), true) {
+				if ev.RunID != "" || ev.AgentID != "" {
+					r.mu.Lock()
+					if r.runID == "" {
+						r.runID = ev.RunID
+					}
+					if r.agentID == "" {
+						r.agentID = ev.AgentID
+					}
+					r.mu.Unlock()
 				}
-				if r.agentID == "" {
-					r.agentID = ev.AgentID
+				if id := ev.ToolCallID(); id != "" {
+					r.noteToolCompletion(id, ev)
 				}
-				r.mu.Unlock()
-			}
-			if id := ev.ToolCallID(); id != "" {
-				r.noteToolCompletion(id, ev)
-			}
-			if ev.Kind == EventResult || ev.Kind == EventDone {
-				r.recordTerminal(ev)
-			}
-			if ev.Kind == EventUsage && ev.Usage != nil {
-				r.mu.Lock()
-				r.usage = ev.Usage
-				r.mu.Unlock()
-			}
-			if ev.Kind == EventStatus && ev.Status != nil && ev.Status.Status == "ERROR" {
-				r.mu.Lock()
-				if r.terminal == nil {
-					r.terminal = &RunResult{Status: "ERROR", ErrorMessage: ev.Status.Message, RunID: r.runID}
+				if ev.Kind == EventResult || ev.Kind == EventDone {
+					r.recordTerminal(ev)
 				}
-				r.mu.Unlock()
-			}
-			if ev.Kind == EventToolCallStarted && ev.ToolCall != nil {
-				id := ev.ToolCall.ID
-				if !r.agent.IsHostTool(ev.ToolCall.ToolName) {
-					// Cursor executed one of its own tools. It is not a host tool
-					// card and must not be replayed as one, but it is not nothing
-					// either: tag it so the provider can show what Cursor did.
-					ev.Kind = EventCursorToolStarted
+				if ev.Kind == EventUsage && ev.Usage != nil {
+					r.mu.Lock()
+					r.usage = ev.Usage
+					r.mu.Unlock()
+				}
+				if ev.Kind == EventStatus && ev.Status != nil && ev.Status.Status == "ERROR" {
+					r.mu.Lock()
+					if r.terminal == nil {
+						r.terminal = &RunResult{Status: "ERROR", ErrorMessage: ev.Status.Message, RunID: r.runID}
+					}
+					r.mu.Unlock()
+				}
+				if ev.Kind == EventToolCallStarted && ev.ToolCall != nil {
+					id := ev.ToolCall.ID
+					if !r.agent.IsHostTool(ev.ToolCall.ToolName) {
+						// Cursor executed one of its own tools. It is not a host tool
+						// card and must not be replayed as one, but it is not nothing
+						// either: tag it so the provider can show what Cursor did.
+						ev.Kind = EventCursorToolStarted
+						r.logCursorTool(ev)
+						if !r.queueEvent(ev) {
+							return
+						}
+						continue
+					}
+					if r.emittedCall(id) {
+						// A durable replay of a call the host already ran: everything
+						// before its completion belongs to text already streamed.
+						r.openBarrierOnCompletion(ev.ToolCall.Status)
+						continue
+					}
+					// Bookkeeping only: the callback path emits the card, so emitting it
+					// here as well would show the same tool call twice.
+					r.markEmitted(id)
+					continue
+				}
+				if ev.Kind == EventToolCallCompleted && ev.ToolCall != nil && !r.agent.IsHostTool(ev.ToolCall.ToolName) {
+					// The other half of Cursor's own tool call: the status, the duration
+					// and the result text, which is what makes the line honest.
+					ev.Kind = EventCursorToolCompleted
 					r.logCursorTool(ev)
-					if !r.queue.push(RunEvent{Event: ev}) {
-						r.overflow()
+					if !r.queueEvent(ev) {
 						return
 					}
 					continue
 				}
-				if r.emittedCall(id) {
-					// A durable replay of a call the host already ran: everything
-					// before its completion belongs to text already streamed.
+				if ev.Kind == EventToolCallCompleted && ev.ToolCall != nil && r.emittedCall(ev.ToolCall.ID) {
 					r.openBarrierOnCompletion(ev.ToolCall.Status)
 					continue
 				}
-				// Bookkeeping only: the callback path emits the card, so emitting it
-				// here as well would show the same tool call twice.
-				r.markEmitted(id)
-				continue
-			}
-			if ev.Kind == EventToolCallCompleted && ev.ToolCall != nil && !r.agent.IsHostTool(ev.ToolCall.ToolName) {
-				// The other half of Cursor's own tool call: the status, the duration
-				// and the result text, which is what makes the line honest.
-				ev.Kind = EventCursorToolCompleted
-				r.logCursorTool(ev)
-				if !r.queue.push(RunEvent{Event: ev}) {
-					r.overflow()
+				if r.suppressed(ev.Kind) {
+					continue
+				}
+				if !r.queueEvent(ev) {
 					return
 				}
-				continue
-			}
-			if ev.Kind == EventToolCallCompleted && ev.ToolCall != nil && r.emittedCall(ev.ToolCall.ID) {
-				r.openBarrierOnCompletion(ev.ToolCall.Status)
-				continue
-			}
-			if r.suppressed(ev.Kind) {
-				continue
-			}
-			if !r.queue.push(RunEvent{Event: ev}) {
-				r.overflow()
-				return
+				if ev.Kind == EventResult || ev.Kind == EventDone {
+					r.mu.Lock()
+					r.fin = true
+					r.mu.Unlock()
+					r.queue.close()
+					return // terminal is final: no reconnect or late output
+				}
 			}
 		}
-	}
-	if err := stream.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		err := stream.Err()
+		_ = stream.Close()
+		if next, ok := r.reconnect(err); ok {
+			stream = next
+			continue
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			r.mu.Lock()
+			if r.terminal == nil {
+				r.drainErr = wrapErr("run stream", err)
+			}
+			r.mu.Unlock()
+		}
 		r.mu.Lock()
-		r.drainErr = wrapErr("run stream", err)
+		paused := r.paused
+		if r.recovering && r.terminal == nil && r.drainErr == nil && !paused {
+			r.drainErr = errors.New("cursor: recovered stream ended before a terminal result; partial output was kept")
+		}
+		if r.terminal == nil && r.drainErr == nil && !paused {
+			r.fin = true
+		}
 		r.mu.Unlock()
+		r.queue.close()
+		return
 	}
-	r.mu.Lock()
-	paused := r.paused
-	if r.terminal == nil && r.drainErr == nil && !paused {
-		r.fin = true
-	}
-	r.mu.Unlock()
-	r.queue.close()
 }
 
 func (r *Run) noteToolCompletion(id string, ev Event) {

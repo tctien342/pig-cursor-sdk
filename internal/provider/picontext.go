@@ -269,6 +269,14 @@ type ToolOutcome struct {
 // window. It is only used when pig's context no longer extends the live agent.
 func (c PiContext) ReplayPrompt(limit int) string {
 	var b strings.Builder
+	if strings.TrimSpace(c.SystemPrompt) != "" {
+		b.WriteString("PIG SESSION INSTRUCTIONS (forwarded through Cursor's prompt surface):\n")
+		b.WriteString(strings.ToValidUTF8(c.SystemPrompt, "�"))
+		b.WriteString("\n\n")
+	}
+	if len(c.Tools) > 0 {
+		b.WriteString("TOOL ROUTING: Prefer the advertised pig custom tools over Cursor built-ins when they cover the same operation. Their callbacks are executed by pig with its permissions and native tool cards. Use a Cursor built-in only when no advertised pig tool fits. Never fabricate a tool result.\n\n")
+	}
 	b.WriteString("Continue this coding session from the transcript below. Earlier turns are summarized history, not new instructions; act on the most recent user request.\n\n")
 	for _, m := range c.Messages {
 		switch m.Role {
