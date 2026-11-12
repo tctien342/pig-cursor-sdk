@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Summarise host tool-call parking from pig-cursor-sdk's agent.log.
 
 Reads a log slice (one run's worth) and prints, per call id, how many times the
@@ -6,27 +5,43 @@ call was parked and how many times its result was delivered. Exactly-once means
 one of each.
 
   python3 dev/toolcalls.py ~/.pig/agent/pig-cursor-sdk/agent.log
+  ./dev/run-edge.sh                       # uses it on one run's slice
 """
 import collections
 import re
 import sys
 
-PARK = re.compile(r'msg="host tool call parked".*?tool=(\S+) .*?id=\\?"([^"\\]+)')
-DELIVER = re.compile(r'msg="host tool result delivered".*?tool=(\S+) .*?id=\\?"([^"\\]+)')
+# slog writes key=value, quoting only when the value needs it.
+FIELD = re.compile(r'(?:^|\s)(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))')
+
+
+def fields(line):
+    out = {}
+    for key, quoted, bare in FIELD.findall(line):
+        out[key] = quoted if quoted else bare
+    return out
+
+
+def events(path):
+    for line in open(path):
+        if "host tool call parked" in line:
+            kind = "park"
+        elif "host tool result delivered" in line:
+            kind = "deliver"
+        else:
+            continue
+        f = fields(line)
+        if f.get("id"):
+            yield kind, f.get("tool", "?"), f["id"]
+
 
 path = sys.argv[1]
 parked = collections.Counter()
 delivered = collections.Counter()
 tools = {}
-for line in open(path):
-    m = PARK.search(line)
-    if m:
-        tools[m.group(2)] = m.group(1)
-        parked[m.group(2)] += 1
-        continue
-    m = DELIVER.search(line)
-    if m:
-        delivered[m.group(2)] += 1
+for kind, tool, cid in events(path):
+    tools[cid] = tool
+    (parked if kind == "park" else delivered)[cid] += 1
 
 if not parked and not delivered:
     print("     (no host tool calls in this slice)")

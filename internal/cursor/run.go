@@ -656,7 +656,7 @@ func (r *Run) Usage() *Usage {
 
 // park holds a host tool call until the host resolves it.
 func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, error) {
-	id := orString(req.ToolCallID, fmt.Sprintf("tool_%d", time.Now().UnixNano()))
+	id := DisplayCallID(orString(req.ToolCallID, fmt.Sprintf("tool_%d", time.Now().UnixNano())))
 	p := &ParkedCall{
 		ID: id, ToolName: req.ToolName, Args: req.Args,
 		ArrivedAt: req.ArrivedAt, done: make(chan struct{}),

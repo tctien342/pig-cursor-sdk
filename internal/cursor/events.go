@@ -2,6 +2,7 @@ package cursor
 
 import (
 	"fmt"
+	"strings"
 
 	sdkpb "github.com/tctien342/pig-cursor-sdk/gen/sdk/v1"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -51,6 +52,7 @@ type Event struct {
 // declared tool name; for host-owned custom tools the bridge reports the
 // envelope name ("mcp") and the real name sits in Args, which Decode unwraps.
 type ToolCallEvent struct {
+	// ID is the call id in host-safe form: see DisplayCallID.
 	ID       string
 	RunID    string
 	AgentID  string
@@ -60,6 +62,41 @@ type ToolCallEvent struct {
 	Result   map[string]any
 	IsError  bool
 	Text     string // the tool result rendered as text, when available
+}
+
+// DisplayCallID normalises a Cursor tool-call id for use as an identifier.
+// Cursor publishes ids that contain a literal newline, e.g.
+//
+//	call-dc6de823-...-1\nfc_00b4b5ed-..._0
+//
+// which is fine inside a JSON string but ugly everywhere an id is expected to be
+// one token: it lands verbatim in the host's session transcript and it breaks
+// one-line-per-event log parsing. Whitespace runs collapse to a single "_", which
+// is injective for ids that differ only in whitespace, and the id is never sent
+// back to the bridge (results are delivered by unblocking the parked callback),
+// so no correlation is lost.
+func DisplayCallID(id string) string {
+	if !strings.ContainsAny(id, " \t\n\r") {
+		return id
+	}
+	var b strings.Builder
+	b.Grow(len(id))
+	pending := false
+	for _, r := range id {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			pending = true
+			continue
+		}
+		if pending {
+			b.WriteByte('_')
+			pending = false
+		}
+		b.WriteRune(r)
+	}
+	if pending {
+		b.WriteByte('_')
+	}
+	return b.String()
 }
 
 // StatusEvent is a run lifecycle status. On failure the human-readable reason
@@ -215,7 +252,7 @@ func decodeToolCall(payload map[string]any, offset string) Event {
 		kind = EventToolCallCompleted
 	}
 	tc := &ToolCallEvent{
-		ID:       str(payload["call_id"]),
+		ID:       DisplayCallID(str(payload["call_id"])),
 		RunID:    str(payload["run_id"]),
 		AgentID:  str(payload["agent_id"]),
 		ToolName: str(payload["name"]),
@@ -282,7 +319,7 @@ func deltaOrSkip(kind EventKind, offset string, payload map[string]any, key stri
 
 func interactionToolCall(payload map[string]any, offset string, kind EventKind) Event {
 	call := mapOrNil(payload["toolCall"])
-	tc := &ToolCallEvent{ID: str(payload["callId"]), Status: "running"}
+	tc := &ToolCallEvent{ID: DisplayCallID(str(payload["callId"])), Status: "running"}
 	if kind == EventToolCallCompleted {
 		tc.Status = "completed"
 	}

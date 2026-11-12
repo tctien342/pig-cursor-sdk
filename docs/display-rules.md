@@ -68,6 +68,22 @@ Live proof after the fix: `docs/evidence/live-batch-tool-turn.jsonl` (host
 executed `echo one` and `echo two`), and `dev/toolcalls.py` over that run's log
 slice reports one park and one delivery per call id.
 
+## Ids are one token
+
+Cursor publishes tool-call ids that contain a literal newline:
+
+```text
+call-dc6de823-12c8-4268-b573-5c28e0ae464f-1\nfc_00b4b5ed-b09c-964d-be33-bfa7a9c6826e_0
+```
+
+Passing that through puts a newline into the host's session transcript and breaks
+one-line-per-event log parsing, so the decoder collapses whitespace runs to `_`
+(`cursor.DisplayCallID`) at both points an id enters: the tool-call frame and the
+tool callback. Same function on both paths, so the parked-ledger key, the card id
+the host sees, and the log line always agree; applying it twice changes nothing.
+Nothing sends the id back to Cursor — results are delivered by unblocking the
+parked callback — so the rewrite loses no correlation.
+
 `dev/run-edge.sh` also checks that a `SIGTERM`'d host leaves no orphaned bridge:
 bridges before = 0, after = 0.
 

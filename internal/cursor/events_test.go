@@ -34,6 +34,30 @@ func loadFixture(t *testing.T) []*sdkpb.RunStreamMessage {
 	return out
 }
 
+// Cursor publishes tool-call ids containing a literal newline (the value below
+// is copied from docs/evidence/live-tool-turn.jsonl). Hosts and log parsers treat
+// ids as one token, so the decoder must hand out a whitespace-free form.
+func TestDisplayCallIDHasNoWhitespace(t *testing.T) {
+	raw := "call-dc6de823-12c8-4268-b573-5c28e0ae464f-1\nfc_00b4b5ed-b09c-964d-be33-bfa7a9c6826e_0"
+	got := DisplayCallID(raw)
+	if strings.ContainsAny(got, " \t\n\r") {
+		t.Fatalf("DisplayCallID kept whitespace: %q", got)
+	}
+	want := "call-dc6de823-12c8-4268-b573-5c28e0ae464f-1_fc_00b4b5ed-b09c-964d-be33-bfa7a9c6826e_0"
+	if got != want {
+		t.Fatalf("DisplayCallID = %q, want %q", got, want)
+	}
+	if DisplayCallID(got) != got {
+		t.Fatal("DisplayCallID is not idempotent; parked and streamed ids could stop matching")
+	}
+	if DisplayCallID(raw) == DisplayCallID(strings.ReplaceAll(raw, "-1\n", "-2\n")) {
+		t.Fatal("ids differing before the newline collapsed to the same value")
+	}
+	if DisplayCallID("plain-id") != "plain-id" {
+		t.Fatal("an id without whitespace must pass through untouched")
+	}
+}
+
 func TestDecodeRealFrames(t *testing.T) {
 	msgs := loadFixture(t)
 
