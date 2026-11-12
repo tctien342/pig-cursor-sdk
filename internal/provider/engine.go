@@ -581,7 +581,7 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 				// Release the leftover run and try the same agent again: keeping it
 				// keeps Cursor's side of the conversation, which a reset throws away.
 				if e.releaseStaleRuns(ctx, sess) {
-					sess.undoSend()
+					// An immediate Send error never advances transcript bookkeeping.
 					continue
 				}
 				e.resetSession(ctx, sess)
@@ -767,6 +767,7 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		sess.AgentID = agent.ID()
 		e.agents.remember(sess.Key, agent.ID())
 		sess.sentFingerprints = nil
+		sess.prevFingerprints = nil
 		// A new agent needs the conversation so far.
 		prompt := cursorTurnPrompt(piCtx, newText, tools, true)
 		if debug {
@@ -801,9 +802,13 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		return e.startTurn(ctx, sess, client, apiKey, entry, piCtx, debug)
 	}
 
+	run, err := agent.Send(goCtx(ctx), cursorTurnPrompt(piCtx, newText, tools, false), images(piCtx.Images()))
+	if err != nil {
+		return nil, err // no automatic resend, and no accepted-prefix advance
+	}
 	sess.prevFingerprints = sess.sentFingerprints
 	sess.sentFingerprints = fingerprints(piCtx)
-	return agent.Send(goCtx(ctx), cursorTurnPrompt(piCtx, newText, tools, false), images(piCtx.Images()))
+	return run, nil
 }
 
 // consume streams assistant prose, thinking, marked inline annotations, and real
@@ -1014,11 +1019,15 @@ func (s *Session) appendedText(piCtx PiContext) (string, bool) {
 			return "", false
 		}
 	}
-	txt := piCtx.UserText()
-	if strings.TrimSpace(txt) == "" {
-		return "", false
+	// Only a user message beyond the accepted prefix is new intent. An old user
+	// request followed only by assistant/tool-result records must not be resent.
+	for i := len(piCtx.Messages) - 1; i >= len(s.sentFingerprints); i-- {
+		if piCtx.Messages[i].Role == "user" {
+			txt := piCtx.UserText()
+			return txt, strings.TrimSpace(txt) != "" || len(piCtx.Images()) > 0
+		}
 	}
-	return txt, true
+	return "", false
 }
 
 func fingerprints(piCtx PiContext) []string {

@@ -175,12 +175,13 @@ func blocksToText(v any) string {
 // Fingerprint is the stable identity of a message for append-only detection.
 func (m Message) Fingerprint() string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|", m.Role, m.EntryID)
+	fmt.Fprintf(h, "%s|%s|%s|%s|%t|", m.Role, m.EntryID,
+		firstString(m.Raw, "toolCallId"), firstString(m.Raw, "toolName"), boolOrNil(m.Raw["isError"]))
 	for _, b := range m.Blocks {
-		fmt.Fprintf(h, "%s:%s:%s:%s;", b.Type, b.ToolName, b.ToolID, truncate(b.Text, 4096))
+		fmt.Fprintf(h, "%s:%s:%s:%t:%s;", b.Type, b.ToolName, b.ToolID, b.IsError, b.Text)
 		if len(b.Args) > 0 {
 			raw, _ := json.Marshal(b.Args)
-			fmt.Fprintf(h, "args:%s;", truncate(string(raw), 4096))
+			fmt.Fprintf(h, "args:%s;", raw)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))[:24]
