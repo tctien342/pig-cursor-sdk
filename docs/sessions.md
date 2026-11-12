@@ -74,6 +74,33 @@ without `ps`, nothing is reaped and nothing is signalled.
 
 `internal/bridge/reap.go`; `TestReapPlanOnlyKillsBridgesWhoseOwnerIsGone`.
 
+## A run left active on your own agent
+
+A turn can end while Cursor is still working — the user sends another message, the
+turn is interrupted, or a deadline passes. The run object stays alive, so the next
+`Send` on that agent used to fail immediately:
+
+```
+cursor: run  is still active for this agent
+```
+
+An error, no answer, and nothing to retry: the turn was dead before it started.
+Sending is now preceded by releasing that leftover run
+(`Agent.supersedeActiveRun`), which is the only outcome that can help — the bridge
+would refuse the send anyway, and the user's new message is the newer intent. Both
+wordings of the blockage (`already has active run` from the bridge, `is still
+active for this agent` from this package) take the same recovery path: cancel what
+is live on the agent, then try the same agent again, so Cursor's side of the
+conversation survives; only if that fails is the agent rebuilt and the transcript
+replayed.
+
+A brand-new agent whose first send fails is dropped rather than kept: it never
+received the conversation, and keeping it would make the retry send only the newest
+message into an empty agent.
+
+`dev/tty-interrupt.py` sends a second message while Cursor is running a 30-second
+shell command and asserts the answer arrives with no error shown.
+
 ## When the leftover run is still there anyway
 
 If a resumed agent still answers `already has active run`, the extension asks

@@ -1,6 +1,9 @@
 package provider
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // Two runs in one directory must not end up sharing a Cursor agent unless they are
 // actually the same conversation. Sharing one is how a session that exits closes
@@ -66,5 +69,28 @@ func TestUndoSendRestoresTheTurnThatNeverLanded(t *testing.T) {
 	}
 	if len(s.prevFingerprints) != 0 {
 		t.Fatal("undoSend should not leave a stale snapshot behind")
+	}
+}
+
+// Both wordings for "a run nobody is reading blocks this agent" must take the same
+// recovery path. The bridge says one; this package's own guard said the other, and
+// that second one used to fail the turn outright.
+func TestStaleAgentErrorMatchesBothWordings(t *testing.T) {
+	for _, msg := range []string{
+		"cursor run stream: Agent c8c7d38a already has active run (unknown)",
+		"cursor: run  is still active for this agent",
+		"cursor: run run-42 is still active for this agent",
+	} {
+		if !isStaleAgentError(errors.New(msg)) {
+			t.Errorf("should be treated as stale: %q", msg)
+		}
+	}
+	for _, msg := range []string{"cursor: agent is closed", "context deadline exceeded", ""} {
+		if isStaleAgentError(errors.New(msg)) {
+			t.Errorf("should not be treated as stale: %q", msg)
+		}
+	}
+	if isStaleAgentError(nil) {
+		t.Error("nil is not a stale agent error")
 	}
 }

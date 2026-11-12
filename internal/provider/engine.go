@@ -574,6 +574,12 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 		run, err := e.startTurn(ctx, sess, client, apiKey, entry, piCtx, debugStream)
 		if err != nil {
 			if attempt == 0 && isStaleAgentError(err) {
+				// Release the leftover run and try the same agent again: keeping it
+				// keeps Cursor's side of the conversation, which a reset throws away.
+				if e.releaseStaleRuns(ctx, sess) {
+					sess.undoSend()
+					continue
+				}
 				e.resetSession(ctx, sess)
 				continue
 			}
@@ -757,11 +763,23 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 		if strings.TrimSpace(newText) != "" {
 			prompt = prompt + "\n\nMOST RECENT USER REQUEST (act on this):\n" + newText
 		}
-		sess.sentFingerprints = fingerprints(piCtx)
 		if debug {
 			e.cfg.Logger.Debug("replaying transcript to a fresh agent", "bytes", len(prompt), "messages", len(piCtx.Messages))
 		}
-		return agent.Send(goCtx(ctx), prompt, images(piCtx.Images()))
+		run, err := agent.Send(goCtx(ctx), prompt, images(piCtx.Images()))
+		if err != nil {
+			// The new agent never received the conversation, so keeping it would make
+			// a retry send only the newest message into an empty agent. Drop it: the
+			// retry replays, which is what a fresh agent needs.
+			_ = agent.Close(goCtx(ctx))
+			sess.agent = nil
+			sess.AgentID = ""
+			sess.sentFingerprints = nil
+			e.agents.forget(sess.Key)
+			return nil, err
+		}
+		sess.sentFingerprints = fingerprints(piCtx)
+		return run, nil
 	}
 
 	if !appended {
@@ -850,7 +868,7 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 		if ct != nil && (ev.Kind == cursor.EventCursorToolStarted || ev.Kind == cursor.EventCursorToolCompleted) {
 			ct.note(ev)
 			if ev.Kind == cursor.EventCursorToolStarted && ev.ToolCall != nil {
-				ctx.SetStatus("cursor-activity", cursorToolHint(ev.ToolCall.ToolName, cursorToolSummary(ev.ToolCall.ToolName, ev.ToolCall.Args)))
+				ctx.SetStatus("cursor-activity", cursorToolHint(ev.ToolCall.ToolName, cursorToolSummary(ev.ToolCall.ToolName, ev.ToolCall.Args), ct.done()))
 			} else {
 				// The line in the transcript says it better than the footer can.
 				ctx.ClearStatus("cursor-activity")
@@ -876,15 +894,10 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 			// The agent we restored from disk still owns a run upstream that this
 			// process cannot see — typical after an interrupted session. Show no
 			// error either way; the question is only how much is thrown away.
-			if sess.agent != nil {
-				if n, rerr := sess.agent.ReleaseStaleRuns(goCtx(ctx)); rerr == nil && n > 0 {
-					// A dead session's run, cancelled: this agent and everything
-					// Cursor remembers about this conversation survive.
-					e.cfg.Logger.Info("cancelled the run another session left on this cursor agent", "runs", n, "agent", sess.AgentID)
-					return turnOutcome{recover: true}
-				} else if rerr != nil {
-					e.cfg.Logger.Debug("could not release the stale cursor run", "err", rerr)
-				}
+			if e.releaseStaleRuns(ctx, sess) {
+				// A dead session's run, cancelled: this agent and everything
+				// Cursor remembers about this conversation survive.
+				return turnOutcome{recover: true}
 			}
 			e.cfg.Logger.Info("restored cursor agent still holds an upstream run; starting a fresh one", "err", err)
 			return turnOutcome{retry: true}
@@ -931,8 +944,35 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 
 // isStaleAgentError recognises Cursor refusing a send because an agent restored
 // from a previous process still owns a run upstream.
+// isStaleAgentError reports whether the agent is blocked by a run nobody in this
+// process is reading. Two wordings reach us: the bridge's ("already has active
+// run") and this package's own guard on a leftover run ("run … is still active
+// for this agent"). Both mean the same thing and have the same cure.
 func isStaleAgentError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "already has active run")
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "already has active run") || strings.Contains(msg, "is still active for this agent")
+}
+
+// releaseStaleRuns cancels the runs another session left live on this agent, so
+// the same agent can be used again with Cursor's side of the conversation intact.
+// False means the caller has to start a fresh agent and replay instead.
+func (e *Engine) releaseStaleRuns(ctx sdk.Context, sess *Session) bool {
+	if sess == nil || sess.agent == nil {
+		return false
+	}
+	n, err := sess.agent.ReleaseStaleRuns(goCtx(ctx))
+	if err != nil {
+		e.cfg.Logger.Debug("could not release runs left on this cursor agent", "err", err)
+		return false
+	}
+	if n == 0 {
+		return false
+	}
+	e.cfg.Logger.Info("cancelled runs left on this cursor agent", "runs", n, "agent", sess.AgentID)
+	return true
 }
 
 // appendedText reports the new user text when pig's transcript extends what we

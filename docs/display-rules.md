@@ -96,6 +96,12 @@ there is no band to draw and nothing else changes; the extension logs that once 
 process (`cursor tool card has no background in this theme`) because the difference
 between "no colour" and "no card" is otherwise invisible.
 
+Text on the band uses `toolTitle` for the call and `toolOutput` for everything
+secondary — never `dim`. `dim` is a faint, darker grey that nearly disappears on a
+coloured band, which is what made one card look like it had dark text beside white
+text. It is the same pair of tokens the host uses for a tool card's own text, so a
+Cursor card and a host card read the same way.
+
 ### It is written after the message it belongs to
 
 The entries are appended once the turn's assistant message has been committed,
@@ -106,6 +112,11 @@ shell calls stacked over a message describing them, which reads as tools firing
 inside a thought. Below the message they read as what they are: that turn's
 activity, in call order. A turn that ends before retrying writes nothing — its
 retry reports its own calls.
+
+Because the lines arrive at the end of the turn, a long turn would otherwise show
+nothing at all while Cursor works. The footer carries the live picture instead:
+`Cursor 3 done · running shell · git diff …` — the running call, and how many have
+already finished.
 
 Why an entry and not a provider event or a message:
 

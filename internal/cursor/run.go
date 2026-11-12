@@ -184,17 +184,9 @@ func settingSource(name string) (sdkpb.SettingSource, bool) {
 // not by the provider call that started it: it keeps streaming after a provider
 // turn ends, because a parked host tool call must survive the boundary.
 func (a *Agent) Send(ctx context.Context, text string, images []Image) (*Run, error) {
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		return nil, errors.New("cursor: agent is closed")
+	if err := a.supersedeActiveRun("superseded by a new turn"); err != nil {
+		return nil, err
 	}
-	if a.run != nil && !a.run.Finished() {
-		prev := a.run
-		a.mu.Unlock()
-		return nil, fmt.Errorf("cursor: run %s is still active for this agent", prev.RunID())
-	}
-	a.mu.Unlock()
 
 	msg := &sdkpb.UserMessage{Text: text}
 	for _, img := range images {
@@ -232,6 +224,35 @@ func (a *Agent) Send(ctx context.Context, text string, images []Image) (*Run, er
 	a.mu.Unlock()
 	go r.drain(stream)
 	return r, nil
+}
+
+// supersedeActiveRun releases a run this agent still holds so the next Send can
+// start.
+//
+// Reaching Send with a live run means the host has moved on: a new message while
+// Cursor was still working, an interrupted turn, or a turn that ended while
+// Cursor ran one of its own tools. Refusing the new turn — the old behaviour —
+// showed the user an error with no way forward, and the bridge would have refused
+// the send anyway ("already has active run"). Releasing the leftover run is the
+// only step that can work, and it costs at most the work that run had left.
+func (a *Agent) supersedeActiveRun(reason string) error {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return errors.New("cursor: agent is closed")
+	}
+	prev := a.run
+	a.mu.Unlock()
+	if prev == nil || prev.Finished() {
+		return nil
+	}
+	if err := prev.CancelRun(reason); err != nil {
+		// The bridge could not be told (or the run had no id yet). Abandoning it
+		// locally still frees this agent, and the caller's stale-run recovery
+		// releases it upstream before the retry.
+		prev.abandon(errors.New("cursor: " + reason))
+	}
+	return nil
 }
 
 // Close releases the agent and any parked callbacks.

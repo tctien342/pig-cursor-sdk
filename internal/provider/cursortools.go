@@ -100,6 +100,20 @@ func (t *cursorToolTracker) note(ev cursor.RunEvent) {
 	}
 }
 
+// done counts the calls of this turn that have already reported a result.
+func (t *cursorToolTracker) done() int {
+	if t == nil {
+		return 0
+	}
+	n := 0
+	for _, call := range t.calls {
+		if call.finished {
+			n++
+		}
+	}
+	return n
+}
+
 // finish writes the transcript lines for the turn, in call order.
 //
 // It is called once, after the assistant message has been committed — never while
@@ -402,9 +416,13 @@ func cursorToolLines(card cursorToolCard, color func(token, text string) string,
 		width = 12
 	}
 	const sep = " · "
-	marker := color("borderMuted", "◇")
+	// Secondary text on a painted band has to stay readable: `dim` is a faint,
+	// darker grey that all but disappears on toolSuccessBg, which is what made one
+	// card look like it had dark text next to white. toolOutput is the token the
+	// host uses for a tool card's supporting text, so it matches the band.
+	marker := color("toolOutput", "◇")
 	label := color("toolTitle", "cursor: "+card.tool)
-	statusWord, statusToken := "", "dim"
+	statusWord, statusToken := "", "toolOutput"
 	switch card.status {
 	case "failed":
 		statusWord, statusToken = "failed", "error"
@@ -414,7 +432,7 @@ func cursorToolLines(card cursorToolCard, color func(token, text string) string,
 	status := color(statusToken, statusWord)
 	duration := ""
 	if card.seconds > 0 {
-		duration = color("dim", fmt.Sprintf("%.1fs", float64(card.seconds)/10))
+		duration = color("toolOutput", fmt.Sprintf("%.1fs", float64(card.seconds)/10))
 	}
 
 	// build lays out one shape of the line. The summary is the elastic part: it
@@ -479,7 +497,7 @@ func cursorToolLines(card cursorToolCard, color func(token, text string) string,
 		if l == "" {
 			continue
 		}
-		lines = append(lines, "   "+color("dim", clip(l, width-3)))
+		lines = append(lines, "   "+color("toolOutput", clip(l, width-3)))
 	}
 	return lines
 }
@@ -616,12 +634,19 @@ func withCardPadding(lines []string) []string {
 }
 
 // cursorToolHint is the live footer line for a call still running. It is the only
-// sign of Cursor-side work between "started" and the line that replaces it.
-func cursorToolHint(tool, summary string) string {
-	if summary == "" {
-		return "Cursor running " + tool
+// sign of Cursor-side work while the turn streams: the transcript lines are
+// written when the turn ends, because anything appended mid-turn would land above
+// the message it belongs to. So the footer also counts what has already finished,
+// which is what tells a reader the turn is making progress and not stuck.
+func cursorToolHint(tool, summary string, done int) string {
+	head := "Cursor running " + tool
+	if summary != "" {
+		head += " · " + clip(oneLine(summary), 40)
 	}
-	return "Cursor running " + tool + " · " + clip(oneLine(summary), 40)
+	if done > 0 {
+		head = fmt.Sprintf("Cursor %d done · %s", done, head)
+	}
+	return head
 }
 
 func cursorToolsDisabled() bool { return os.Getenv("PI_CURSOR_SHOW_TOOLS") == "0" }

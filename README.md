@@ -271,6 +271,7 @@ python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty
 ./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
 dev/.venv/bin/python dev/tty-cursor-tools.py  # Cursor's own tools on screen: live, ctrl+o, and after resume
 dev/.venv/bin/python dev/tty-two-sessions.py  # sessions in one directory: one exits, the rest survive
+dev/.venv/bin/python dev/tty-interrupt.py    # a message sent while Cursor is working still gets an answer
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
 cd dev && go run ./cmd/planprobe  # plan numbers + timings, without starting pig
 ```

@@ -437,3 +437,34 @@ func TestRateLimitSummaryShowsOnlyWhatCursorReported(t *testing.T) {
 		}
 	}
 }
+
+// A new turn must not die because the previous one left this agent holding a run.
+// That is what happened in a real session: the user sent a message while Cursor was
+// still running its own shell tool, and the turn failed instantly with
+// "run … is still active for this agent" — no answer, no card, nothing to retry.
+func TestSupersedeReleasesALeftoverRun(t *testing.T) {
+	a := &Agent{toolSet: map[string]bool{}}
+	left := newRun(a, context.Background(), func() {})
+	a.run = left
+
+	if err := a.supersedeActiveRun("superseded by a new turn"); err != nil {
+		t.Fatalf("a leftover run must not refuse the new turn: %v", err)
+	}
+	if !left.Finished() {
+		t.Fatal("the leftover run should have been released")
+	}
+
+	// Nothing to do when the previous run is already over.
+	done := newRun(a, context.Background(), func() {})
+	done.abandon(errors.New("finished"))
+	a.run = done
+	if err := a.supersedeActiveRun("again"); err != nil {
+		t.Fatalf("a finished run should be left alone: %v", err)
+	}
+
+	// A closed agent is a real refusal, and must stay one.
+	a.closed = true
+	if err := a.supersedeActiveRun("closed"); err == nil {
+		t.Fatal("a closed agent must refuse to send")
+	}
+}
