@@ -192,27 +192,23 @@ schemas** to Cursor, so when Cursor calls `bash`, pig executes `bash` and render
 its own card, with its own hooks and permissions. Nothing about a tool call is
 ever written into the thinking channel.
 
-When Cursor uses one of **its own** tools instead — its built-in shell, reader,
-search — pig has no tool to run and no card to attach, so the extension draws the
-line itself:
+Cursor's **own** tools appear inline as plain text, exactly between the assistant
+blocks surrounding the call's start event:
 
 ```text
- ◇ cursor: shell · ls -1 · 2.6s
- ◇ cursor: grep · deferPlanWork
-   command: grep -rn deferPlanWork .        # ctrl+o for the arguments
+I'll inspect the diff.
+
+◇ cursor: shell · git diff --stat
+
+Now I'll check the files.
 ```
 
-While the turn runs, the same cards appear in a widget above the editor — a running
-call in the pending colour, turning green with its duration when it ends — and move
-into the transcript when the turn finishes, so a call is never silent while it works
-and never recorded twice.
-
-One line per call, drawn as a card in pig's own tool-card colours — the background
-band covers an empty row, the line, and an empty row, so calls in a burst read as
-separate calls. Written after the turn's message is committed, never while it
-streams, so a call is never drawn above the thinking it happened inside. It comes
-from a custom session entry, which is never model context: the model is not shown
-another agent's tool traces, and a resumed session redraws the same lines.
+Only the currently running call appears above the editor as a compact hint.
+Completed calls stay inline, never as a list beside the usage bar. New inline
+annotations are ordinary assistant text, without native card backgrounds or
+ctrl+o expansion; they may be visible to other models and compaction. Generated
+blocks have a namespaced text signature so Cursor's replay can omit them without
+removing real assistant prose. Old custom-entry tool cards still redraw on resume.
 
 The run parks on an open bridge callback while pig runs the tool; the callback is
 resolved exactly once from the next request's `toolResult`, and the run continues
@@ -274,10 +270,9 @@ dev/.venv/bin/python dev/tty-reload-check.py   # chat, /reload, and a turn after
 ./dev/bar-screen.sh               # the bar, read back from a terminal emulator's screen
 python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty-session.txt
 ./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
-dev/.venv/bin/python dev/tty-cursor-tools.py  # Cursor's own tools on screen: live, ctrl+o, and after resume
+dev/.venv/bin/python dev/tty-inline-tools.py  # inline order, one running hint, saved metadata and resume
 dev/.venv/bin/python dev/tty-two-sessions.py  # sessions in one directory: one exits, the rest survive
 dev/.venv/bin/python dev/tty-interrupt.py    # a message sent while Cursor is working still gets an answer
-dev/.venv/bin/python dev/tty-live-tools.py   # the running card is on screen during the call, once after
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
 cd dev && go run ./cmd/planprobe  # plan numbers + timings, without starting pig
 ```
@@ -300,12 +295,10 @@ the hang is in [docs/evidence/tty-reload.txt](docs/evidence/tty-reload.txt).
   comes from Cursor's app API rather than a published contract (see *Plan usage*).
   Rolling 5-hour windows are not exposed by either surface — only the billing
   cycle is.
-- If Cursor answers with one of *its own* built-in tools instead of a host tool,
-  there is no host card to render, so the extension draws its own line —
-  `◇ cursor: shell · ls -1 · 2.6s`, with ctrl+o for the arguments. It is a custom
-  session entry, not model context, so it never reaches the transcript Cursor is
-  replayed. Cursor reports no result text for these calls, so the line says what
-  ran and how it ended, never what it printed. Disable with `PI_CURSOR_SHOW_TOOLS=0`.
+- Cursor-internal tools are inline text annotations, not executable pig tools.
+  They show the command at its event position, not tool output. Other providers
+  can see those lines; Cursor replay omits exactly marked display blocks. Disable
+  annotations and the single running hint with `PI_CURSOR_SHOW_TOOLS=0`.
 - Several pig sessions in one directory each need their own Cursor agent — Cursor
   tolerates exactly one driver per agent — so only one of them resumes Cursor's
   side of a conversation and the others replay it. Windows on the *same* session

@@ -35,10 +35,8 @@ type Config struct {
 	// DisableHostTools advertises no tools at all (escape hatch for testing).
 	DisableHostTools bool
 
-	// LiveTools is called as Cursor-side tool calls start and finish, and with nil
-	// when the turn is over. The host uses it to draw them while the turn streams:
-	// transcript entries cannot, because anything appended mid-turn lands above the
-	// message it belongs to. Nil disables it.
+	// LiveTools receives zero or one currently running internal call, and nil on
+	// turn teardown. Inline annotations are independent of this optional UI hint.
 	LiveTools func(ctx sdk.Context, calls []LiveToolView)
 }
 
@@ -806,9 +804,8 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 	return agent.Send(goCtx(ctx), newText, images(piCtx.Images()))
 }
 
-// consume turns run events into pig provider events. This is the display
-// contract: only assistant text, thinking, and real host tool calls reach the
-// transcript.
+// consume streams assistant prose, thinking, marked inline annotations, and real
+// host tool calls. Cursor-internal tools never become executable toolCall blocks.
 // turnOutcome reports whether the caller should retry the turn with a clean
 // session. Only a failure that happens before any content reached the host can
 // be retried, so a retry never duplicates a partially streamed message.
@@ -819,29 +816,15 @@ type turnOutcome struct {
 	recover bool
 }
 
-func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) (outcome turnOutcome) {
+func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) turnOutcome {
 	em := newTurnEmitter(model, entry)
 	em.sink = func(ev map[string]any) { stream.Push(ev) }
 	em.hostToolSet = toolNameSet(tools)
 
-	// Cursor-side tool calls: one transcript line each, written when the call
-	// finishes, plus a live footer line while one is running. See cursortools.go
-	// for why this is a session entry and never a provider event.
-	ct := newCursorToolTracker(ctx, e.cfg.Logger)
-	if cursorToolsDisabled() || !ctx.HasUI() {
-		ct = nil
-	}
-	// Written after the message, on every path that keeps the turn: see
-	// cursorToolTracker.finish. A retried turn reports its own calls, so its
-	// discarded attempt writes nothing.
+	// Annotations are streamed inline; the entry renderer is only for old history.
 	defer func() {
-		if ct != nil && !outcome.retry && !outcome.recover {
-			ct.finish()
-		}
 		ctx.ClearStatus("cursor-activity")
-		// The cards move into the transcript here, so the live widget has nothing
-		// left to show.
-		if e.cfg.LiveTools != nil {
+		if e.cfg.LiveTools != nil && ctx.HasUI() {
 			e.cfg.LiveTools(ctx, nil)
 		}
 	}()
@@ -875,21 +858,20 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 			e.failWith(stream, em.p, model, errors.New(msg))
 			return turnOutcome{}
 		}
-		if ct != nil && (ev.Kind == cursor.EventCursorToolStarted || ev.Kind == cursor.EventCursorToolCompleted) {
-			ct.note(ev)
-			if ev.Kind == cursor.EventCursorToolStarted && ev.ToolCall != nil {
-				ctx.SetStatus("cursor-activity", cursorToolHint(ev.ToolCall.ToolName, cursorToolSummary(ev.ToolCall.ToolName, ev.ToolCall.Args), ct.done()))
-			} else {
-				// The line in the transcript says it better than the footer can.
-				ctx.ClearStatus("cursor-activity")
-			}
-			if e.cfg.LiveTools != nil {
-				e.cfg.LiveTools(ctx, ct.snapshot())
-			}
-		}
 		if em.add(ev) {
 			hosted = true
 			continue
+		}
+		if ev.Kind == cursor.EventCursorToolStarted || ev.Kind == cursor.EventCursorToolCompleted {
+			live := em.cursorTools.snapshot()
+			if len(live) > 0 {
+				ctx.SetStatus("cursor-activity", cursorToolHint(live[0].Tool, live[0].Summary, 0))
+			} else {
+				ctx.ClearStatus("cursor-activity")
+			}
+			if e.cfg.LiveTools != nil && ctx.HasUI() {
+				e.cfg.LiveTools(ctx, live)
+			}
 		}
 		if hosted && ev.Kind == cursor.EventStatus && ev.Status != nil && ev.Status.Status == "tool_pending" {
 			// Cursor is blocked on our callbacks now: the batch is complete.
@@ -1330,7 +1312,7 @@ func (p *partial) joinedText() string {
 
 func (p *partial) hasNoText() bool {
 	for _, b := range p.content {
-		if m, _ := b.(map[string]any); m != nil && firstString(m, "type") == "text" && firstString(m, "text") != "" {
+		if m, _ := b.(map[string]any); m != nil && firstString(m, "type") == "text" && firstString(m, "textSignature") != cursorToolTextSignature && firstString(m, "text") != "" {
 			return false
 		}
 	}

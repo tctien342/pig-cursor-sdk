@@ -16,13 +16,10 @@ into pig provider events, so the rules are one place, testable without a bridge.
    name and the parsed argument object, so pig draws its native card and runs its
    own hooks, permissions, and result rendering. The `id` is Cursor's call id,
    which is what the resumed run matches its tool result against.
-3. **The tool channel is never faked.** Cursor's shell/read/write activity, step
-   frames, lifecycle chatter, and protocol payloads never enter text or thinking,
-   and never become a `toolCall` block: there is no host tool behind them, so a
-   card would promise a tool call pig cannot run. What Cursor ran instead is one
-   annotation line per call — see *Cursor's own tool calls* below. While a call is
-   still running the footer says `Cursor running shell · ls -1`, and it clears when
-   the line replaces it.
+3. **The executable tool channel is never faked.** Cursor-internal calls are
+   bounded plain text annotations at their event boundary, never host `toolCall`
+   blocks and never thinking text. Protocol payloads and tool output are not
+   injected. See *Cursor\'s own tool calls* for the model-context trade-off.
 4. **One card per call, resolved exactly once.** The bridge callback is the
    authoritative record of a host tool call; the stream's own `tool_call` frame
    for the same id is bookkeeping only. A duplicate callback for the same id is
@@ -47,7 +44,7 @@ into pig provider events, so the rules are one place, testable without a bridge.
 
 | rule | test |
 | --- | --- |
-| 1, 3 | `TestEmitsOnlyTextThinkingAndHostToolCalls` — a Cursor-side call produces no provider event at all, even if the run stream ever fails to tag one |
+| 1, 3 | `TestEmitsOnlyTextThinkingAndHostToolCalls` — untagged unknown calls cannot become executable host tools |
 | 2 | `TestHostToolCardCarriesRealNameAndArgs` |
 | 5 | `TestStreamedTextIsNeverDuplicated` |
 | 6 | `TestResumedTurnStillDeliversTheFinalAnswer` |
@@ -59,121 +56,53 @@ Exactly-once and duplicate-callback behaviour (rule 4) is covered in
 
 ## Cursor's own tool calls
 
-A Cursor agent has built-in tools that were never advertised to it — its own
-shell, reader, search. pig cannot run them and has no card to attach to, so for a
-long time this extension printed nothing, which read as the agent stalling.
-Silence was the wrong answer: what Cursor ran is a fact about the turn.
-
-It is shown as **one custom session entry per call**, rendered by the extension
-(`e.EntryRenderer(provider.CursorToolEntryType, …)`):
+Internal tools are now **plain inline text annotations** in the assistant message,
+emitted at the call's start event, not custom entries appended at turn end:
 
 ```text
- ◇ cursor: shell · ls -1 · 2.6s          finished; the duration says it ran
- ◇ cursor: shell · cargo test · failed   Cursor reported an error
- ◇ cursor: read · src/x.go · no result   the turn ended while it was running
- ◇ cursor: grep · deferPlanWork          no duration: it was under 0.1s
+I'll inspect the changes.
+
+◇ cursor: shell · git diff --stat
+
+Now I'll check the files.
 ```
 
-with ctrl+o expanding the arguments it ran with:
+The emitter closes preceding text/thinking before the annotation, and opens a new
+block for following text/thinking. Duplicate SDK envelopes do not add duplicate
+lines. Success does not add another line; failure is noted when reported, and
+unfinished calls say `no result` at turn end. Tool output is not invented or dumped
+into the message. Internal calls never become executable host `toolCall` blocks.
 
-```text
- ◇ cursor: shell · ls -1 · 2.6s
-   command: ls -1
-   timeout: 30000
-```
+This is the user's chosen trade-off: annotations are assistant text, so other
+providers and pig's compaction can see them. Generated blocks carry the exact
+`textSignature: pig-cursor-sdk:internal-tool:v1` marker. Cursor's `ReplayPrompt`
+omits only those marked assistant blocks, preserving user text and lookalike prose.
+These are metadata markers, not a security boundary; other providers or compaction
+may rewrite the blocks and lose the marker.
 
-### It is drawn as a card, in the host's own colours
+There is no native tool-card background or ctrl+o expansion for the new inline
+text. The legacy `cursor-tool` entry renderer remains registered so older sessions
+still redraw their original cards, but new turns do not write those entries.
 
-Each call gets the background pig gives a tool card that ended the same way —
-`toolSuccessBg`, `toolErrorBg`, `toolPendingBg` — and the card is a **band of three
-painted rows**: an empty row, the line, an empty row, all in that colour, so the
-text sits inside the colour instead of floating in a stripe. Padding outside the
-colour would just be space; padding inside it is what makes one call read as one
-card, which matters most when a turn fires a burst of them.
+The widget above the editor shows **only one currently running hint**: the newest
+unfinished call. Completed calls never accumulate beside the usage bar. When that
+call finishes an older concurrent call can become the hint; when none remain the
+widget is cleared. All turn exit paths remove the hint.
 
-A theme is allowed to map those tokens to the terminal default, in which case
-there is no band to draw and nothing else changes; the extension logs that once per
-process (`cursor tool card has no background in this theme`) because the difference
-between "no colour" and "no card" is otherwise invisible.
-
-Text on the band uses `toolTitle` for the call and `toolOutput` for everything
-secondary — never `dim`. `dim` is a faint, darker grey that nearly disappears on a
-coloured band, which is what made one card look like it had dark text beside white
-text. It is the same pair of tokens the host uses for a tool card's own text, so a
-Cursor card and a host card read the same way.
-
-### It is written after the message it belongs to
-
-The entries are appended once the turn's assistant message has been committed,
-never while it streams. pig writes an entry the moment it is asked to and commits
-the message at the end of the turn, so anything written mid-turn lands **above** the
-thinking and text it was interleaved with. In a real session that showed fourteen
-shell calls stacked over a message describing them, which reads as tools firing
-inside a thought. Below the message they read as what they are: that turn's
-activity, in call order. A turn that ends before retrying writes nothing — its
-retry reports its own calls.
-
-### While the turn runs: cards above the editor
-
-Because the lines arrive at the end of the turn, a long turn would otherwise show
-nothing at all while Cursor works. So the same cards are drawn in a widget above the
-editor as each call starts, updated when it ends — a running call in the pending
-colour saying `running`, which turns into the success colour with its duration where
-it stands. Up to six are shown, oldest dropped first; the transcript keeps the whole
-list. When the turn ends the widget is cleared and the cards are written into the
-transcript, so the call appears exactly once in the record.
-
-The footer carries the one-line summary while that happens:
-`Cursor 3 done · running shell · git diff …` — the running call, and how many have
-already finished.
-
-This is the closest a Cursor-side call can get to a host tool card. A host tool is a
-content block inside the assistant message, so pig streams its card in place; a
-Cursor-side call is not a host tool and must never become a content block, because
-everything in the message is replayed to the model. A widget and a session entry are
-the two surfaces that are not model context, so the call is shown in both: live in
-the widget, permanent in the entry.
-
-Why an entry and not a provider event or a message:
-
-- a custom entry is **not model context** (session-format: "It does not become
-  model context"), so neither pig's next turn nor the transcript this extension
-  replays to Cursor ever contains it. Injecting tool traces into the assistant
-  message is exactly what put 60% of the thinking characters in the old extension.
-- it persists, so a resumed session redraws the same line from stored data — with
-  no live run, and with whatever theme the user has now.
-- the summary is chosen per kind of call (command for a shell, pattern for a
-  grep, path for a read/edit), because a grep line without its pattern is noise.
-- one line, never two: the live stream reports the same call twice through two
-  envelopes, so calls are keyed by Cursor's id, and unfinished calls are written
-  at turn end as `no result` rather than vanishing.
-
-Nothing of Cursor's tool *output* is stored or shown: measured on a real account,
-a built-in call reports no result text at all, and a second agent's tool dump in
-the transcript is what this document exists to forbid.
-
-`PI_CURSOR_SHOW_TOOLS=0` turns the lines off; the footer hint stays, so the tool
-activity is never silently invisible.
+`PI_CURSOR_SHOW_TOOLS=0` disables new inline annotations and the running widget.
 
 | rule | test |
 | --- | --- |
-| one line per call, unfinished calls say so | `TestTrackerWritesOneEntryPerCall`, `TestCursorToolLineNeverClaimsWhatDidNotHappen` |
-| what the summary says | `TestCursorToolSummaryNamesWhatTheCallDid` |
-| one line, never wrapped, outcome survives a narrow terminal | `TestCursorToolLineStaysOneLineAndKeepsItsOutcome` |
-| expanded view adds the arguments | `TestCursorToolExpandedAddsArguments` |
-| a rejected entry must not fail the turn | `TestTrackerSurvivesARejectedEntry` |
-| nothing is written until the message is committed | `TestTrackerWritesNothingUntilTheTurnIsCommitted` |
-| the band is painted blank row, line, blank row | `TestCursorToolCardPadsInsideTheBackground`, `TestPaintCursorToolLineFillsTheWidth` |
-| the band colour follows the outcome | `TestCursorToolBackgroundMatchesOutcome` |
-| the live view shows running last, capped | `TestLiveToolSnapshotMarksTheRunningCall` |
+| text → call → thinking → call → text, valid block lifecycle | `TestInlineToolsFollowEventOrder` |
+| terminal-only answer survives annotations; failure/unfinished notes | `TestInlineToolsTerminalAnswerAndOutcomes` |
+| duplicate/anonymous events and sanitized commands | `TestInlineToolsConsecutiveAndAnonymous` |
+| only exact marked assistant blocks excluded from Cursor replay | `TestInlineToolReplayStripsOnlyMarkedAssistantBlocks` |
+| no annotations or hint when disabled | `TestInlineToolsDisabled` |
+| one newest unfinished hint, no completed-call list | `TestLiveToolSnapshotOnlyRunning` |
 
-Live proof: `dev/tty-cursor-tools.py` — runs a turn with no host tools advertised
-(so Cursor can only use its own), asserts the line is on the real screen, that the
-three rows of the card share a background **as cells on the emulated screen** (not
-as escape codes that were merely written), that ctrl+o expands it, that the entry
-sits below its message in the session file, and that reopening the session draws it
-again from the entry, and that the running card is on screen while the call runs
-(`dev/tty-live-tools.py`).
+Live check: `dev/.venv/bin/python dev/tty-inline-tools.py` verifies actual screen
+order, one running hint, saved text signatures, no duplicate custom entries, no
+host execution and redraw after resume. It uses an isolated session directory.
 
 ## A batch of tool calls is one turn
 

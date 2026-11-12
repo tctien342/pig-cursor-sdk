@@ -2,6 +2,7 @@ package provider
 
 import (
 	"encoding/json"
+	"strings"
 
 	cursor "github.com/tctien342/pig-cursor-sdk/internal/cursor"
 )
@@ -9,11 +10,10 @@ import (
 // turnEmitter is the display contract of this extension, as one object.
 //
 // It turns Cursor run events into the only pig provider events this extension
-// ever emits: assistant text, thinking, and real host tool calls. Everything
-// else Cursor produces (its own tool activity, step frames, status chatter,
-// duplicate sdk_message copies of text already streamed as deltas) is
-// bookkeeping and never reaches the transcript. Keeping the mapping in one pure
-// object is what makes it testable without a bridge, and keeps the rules
+// ever emits: assistant text (including marked inline tool annotations),
+// thinking, and real host tool calls. Step frames, status chatter and duplicate
+// sdk_message copies of text already streamed as deltas remain bookkeeping.
+// Keeping the mapping in one pure object makes it testable without a bridge, with rules
 // enforceable instead of scattered through the streaming path.
 type turnEmitter struct {
 	p    *partial
@@ -22,10 +22,15 @@ type turnEmitter struct {
 	tools       []map[string]any
 	pending     []pendingRef
 	hostToolSet map[string]bool
+	cursorTools *cursorToolTracker
 }
 
 func newTurnEmitter(model map[string]any, entry *ModelEntry) *turnEmitter {
-	return &turnEmitter{p: newPartial(model, entry)}
+	t := &turnEmitter{p: newPartial(model, entry)}
+	if !cursorToolsDisabled() {
+		t.cursorTools = &cursorToolTracker{calls: map[string]*cursorToolCall{}}
+	}
+	return t
 }
 
 // emit records the event and forwards it when a sink is attached. Tests read
@@ -65,6 +70,7 @@ func (t *turnEmitter) add(ev cursor.RunEvent) (stop bool) {
 		if ev.Text == "" {
 			return false
 		}
+		t.closeText()
 		idx := t.p.openThinking()
 		if !t.p.thinkStarted {
 			t.p.thinkStarted = true
@@ -86,12 +92,20 @@ func (t *turnEmitter) add(ev cursor.RunEvent) (stop bool) {
 		t.push(map[string]any{"type": "text_delta", "contentIndex": idx, "delta": ev.Text})
 	case cursor.EventToolCallStarted:
 		// A Cursor-side call normally reaches this emitter already tagged (see
-		// cursor.EventCursorToolStarted) and is displayed as a session entry. This
+		// cursor.EventCursorToolStarted) and is displayed as inline text. This
 		// check is the backstop: an untagged one must still never become a host card.
 		if ev.ToolCall != nil && !t.isHostTool(ev.ToolCall.ToolName) {
 			return false
 		}
 		return t.hostToolCall(ev)
+	case cursor.EventCursorToolStarted, cursor.EventCursorToolCompleted:
+		call, fresh, completed := t.cursorTools.note(ev)
+		if fresh {
+			t.cursorToolAnnotation(call, "")
+		}
+		if completed && call.isError {
+			t.cursorToolAnnotation(call, "failed")
+		}
 	case cursor.EventUsage:
 		if ev.Usage != nil {
 			t.p.usage = ev.Usage
@@ -102,6 +116,29 @@ func (t *turnEmitter) add(ev cursor.RunEvent) (stop bool) {
 		}
 	}
 	return false
+}
+
+// cursorToolAnnotation is display text, never a toolCall. At the start event it
+// separates the preceding prose/thinking from whatever the model emits next.
+// Successful calls need no second line; failure notes appear when reported.
+func (t *turnEmitter) cursorToolAnnotation(call *cursorToolCall, outcome string) {
+	if call == nil {
+		return
+	}
+	t.closeThinking()
+	t.closeText()
+	line := cursorToolLines(cursorToolCard{tool: oneLine(call.tool),
+		summary: cursorToolSummary(call.tool, call.args), status: outcome},
+		func(_ string, text string) string { return text }, false, 160)[0]
+	idx := t.p.openText()
+	block := t.p.block(idx).(map[string]any)
+	block["textSignature"] = cursorToolTextSignature
+	t.p.textStarted = true
+	t.push(map[string]any{"type": "text_start", "contentIndex": idx})
+	delta := "\n\n" + strings.TrimSpace(line) + "\n\n"
+	t.p.appendText(delta)
+	t.push(map[string]any{"type": "text_delta", "contentIndex": idx, "delta": delta})
+	t.closeText()
 }
 
 // hostTools is the set the agent advertised to Cursor; a name outside it is
@@ -155,6 +192,15 @@ func (t *turnEmitter) statusFailure(ev cursor.RunEvent) (string, bool) {
 // on a host tool call, whose final text arrives on the result frame rather than
 // as deltas.
 func (t *turnEmitter) finish(reason string, terminal *cursor.RunResult) string {
+	if t.cursorTools != nil {
+		for _, id := range t.cursorTools.order {
+			call := t.cursorTools.calls[id]
+			if !call.finished {
+				t.cursorToolAnnotation(call, "unfinished")
+				call.finished = true
+			}
+		}
+	}
 	if len(t.tools) > 0 {
 		t.closeThinking()
 		t.closeText()

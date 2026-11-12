@@ -37,12 +37,13 @@ type Message struct {
 
 // Block is one content block of a message.
 type Block struct {
-	Type     string // text | thinking | image | toolCall | toolResult
-	Text     string
-	ToolName string
-	ToolID   string
-	Args     map[string]any
-	IsError  bool
+	TextSignature string // provider display metadata; not part of the visible text
+	Type          string // text | thinking | image | toolCall | toolResult
+	Text          string
+	ToolName      string
+	ToolID        string
+	Args          map[string]any
+	IsError       bool
 }
 
 // ParsePiContext decodes the host's context map. Unknown shapes are tolerated:
@@ -118,7 +119,7 @@ func parseMessage(m map[string]any) (Message, bool) {
 			}
 			switch firstString(bm, "type") {
 			case "text":
-				msg.Blocks = append(msg.Blocks, Block{Type: "text", Text: firstString(bm, "text")})
+				msg.Blocks = append(msg.Blocks, Block{Type: "text", Text: firstString(bm, "text"), TextSignature: firstString(bm, "textSignature")})
 			case "thinking":
 				msg.Blocks = append(msg.Blocks, Block{Type: "thinking", Text: firstString(bm, "thinking")})
 			case "image":
@@ -278,6 +279,9 @@ func (c PiContext) ReplayPrompt(limit int) string {
 			}
 		case "assistant":
 			for _, bl := range m.Blocks {
+				if bl.TextSignature == cursorToolTextSignature {
+					continue // generated inline display, not assistant prose for Cursor replay
+				}
 				if bl.Type == "text" && strings.TrimSpace(bl.Text) != "" {
 					fmt.Fprintf(&b, "ASSISTANT: %s\n", truncate(bl.Text, limit))
 				}

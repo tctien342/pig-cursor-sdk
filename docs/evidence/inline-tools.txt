@@ -1,0 +1,18 @@
+Focused display verification (one Cursor model turn, isolated session storage)
+
+Commands:
+  go test ./internal/provider -count=1
+  go build .
+  go vet ./internal/provider
+Result: PASS
+
+  dev/.venv/bin/python dev/tty-inline-tools.py
+Result:
+  PASS: one running hint during the call
+  PASS: saved prose → signed tool annotation → prose; no custom entry or host call
+  PASS: actual screen prose → annotation → prose; no completed-call widget list
+  PASS: resume redraws one inline annotation, no widget
+  PASS: inline tool position and single running hint
+
+The PTY check inspects actual terminal text and saved textSignature metadata.
+Only plain inline annotations are promised, not native tool-card backgrounds.

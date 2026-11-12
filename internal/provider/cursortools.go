@@ -17,35 +17,17 @@ import (
 	cursor "github.com/tctien342/pig-cursor-sdk/internal/cursor"
 )
 
-// Cursor's own tools, shown honestly.
-//
-// A Cursor agent can run tools that were never advertised to it — its built-in
-// shell, reader, web search. pig cannot execute or render those, so there is no
-// host card for them, and for a long time this extension printed nothing at all,
-// which read as the agent stalling. Silence is the wrong default: what Cursor did
-// is a fact about the turn. What was wrong before is *where* it was put — a
-// provider event of some invented type, or text in the thinking channel, both of
-// which land in the model's transcript.
-//
-// So it goes into a custom session entry with an extension renderer: a real
-// transcript line, in the transcript's own grammar, that pig does not send back
-// to any model and Cursor never sees. The line is written when the call finishes,
-// because a line about a tool that never completed is a lie, and one line per
-// call, because Cursor runs these in bursts.
-
-// CursorToolEntryType is the customType of the transcript entry, and the key the
-// renderer is registered under.
+// Cursor's internal calls are plain inline annotations in new turns. The custom
+// entry renderer remains registered only to redraw older sessions.
 const CursorToolEntryType = "cursor-tool"
 
-// cursorToolTracker owns one turn's Cursor-side tool calls.
+// An exact namespaced marker lets Cursor replay omit generated display blocks
+// without deleting model prose that happens to look like a tool annotation.
+const cursorToolTextSignature = "pig-cursor-sdk:internal-tool:v1"
+
 type cursorToolTracker struct {
-	// appendEntry is the host call, held as a function so the display rules can be
-	// tested without a host.
-	appendEntry func(map[string]any) error
-	log         *slog.Logger
-	calls       map[string]*cursorToolCall
-	order       []string
-	wrote       map[string]bool
+	calls map[string]*cursorToolCall
+	order []string
 }
 
 type cursorToolCall struct {
@@ -58,85 +40,64 @@ type cursorToolCall struct {
 	isError   bool
 }
 
-// newCursorToolTracker returns nil when there is no transcript to write to: with
-// no UI there is nobody to read the line, and a headless host would only pay for
-// the entry. Callers may call its methods on a nil tracker.
-func newCursorToolTracker(ctx sdk.Context, log *slog.Logger) *cursorToolTracker {
-	if cursorToolsDisabled() || !ctx.HasUI() {
-		return nil
-	}
-	return &cursorToolTracker{
-		appendEntry: func(data map[string]any) error { return ctx.AppendEntry(CursorToolEntryType, data) },
-		log:         log,
-		calls:       map[string]*cursorToolCall{},
-		wrote:       map[string]bool{},
-	}
-}
-
-// note records one Cursor-side tool event, and writes the transcript line when
-// the call is over. The same call arrives twice on a live stream (once as an
-// sdk_message, once as an interaction_update), so every step is keyed by id.
-func (t *cursorToolTracker) note(ev cursor.RunEvent) {
+// note deduplicates the SDK's two envelopes. Missing IDs use a deterministic
+// name/arguments key: matching anonymous envelopes are treated as one call since
+// the protocol supplies no way to distinguish them.
+func (t *cursorToolTracker) note(ev cursor.RunEvent) (call *cursorToolCall, fresh, completed bool) {
 	if t == nil || ev.ToolCall == nil {
-		return
+		return nil, false, false
 	}
-	id := ev.ToolCall.ID
+	tc := ev.ToolCall
+	id := tc.ID
 	if id == "" {
-		id = ev.ToolCall.ToolName + "\x00" + fmt.Sprint(len(t.order))
+		raw, _ := json.Marshal(tc.Args)
+		id = tc.ToolName + "\x00" + string(raw)
+		// A completion sometimes omits args. Prefer the latest matching open call.
+		if ev.Kind == cursor.EventCursorToolCompleted {
+			for i := len(t.order) - 1; i >= 0; i-- {
+				prev := t.calls[t.order[i]]
+				if prev.tool == tc.ToolName && (!prev.finished || len(tc.Args) == 0) {
+					id = prev.id
+					break
+				}
+			}
+		}
 	}
-	call, ok := t.calls[id]
-	if !ok {
-		call = &cursorToolCall{id: id, tool: ev.ToolCall.ToolName, args: ev.ToolCall.Args, startedAt: time.Now()}
+	call = t.calls[id]
+	if call == nil {
+		call = &cursorToolCall{id: id, tool: tc.ToolName, args: tc.Args}
+		if ev.Kind == cursor.EventCursorToolStarted {
+			call.startedAt = time.Now()
+		}
 		t.calls[id] = call
 		t.order = append(t.order, id)
+		fresh = true
 	}
-	if ev.Kind == cursor.EventCursorToolCompleted {
+	if ev.Kind == cursor.EventCursorToolCompleted && !call.finished {
 		call.finished = true
-		call.isError = ev.ToolCall.IsError || ev.ToolCall.Status == "error"
+		call.isError = tc.IsError || tc.Status == "error"
 		call.endedAt = time.Now()
-		if len(call.args) == 0 {
-			call.args = ev.ToolCall.Args
-		}
+		completed = true
 	}
+	if len(call.args) == 0 {
+		call.args = tc.Args
+	}
+	return
 }
 
-// done counts the calls of this turn that have already reported a result.
-func (t *cursorToolTracker) done() int {
-	if t == nil {
-		return 0
-	}
-	n := 0
-	for _, call := range t.calls {
-		if call.finished {
-			n++
+// snapshot is a glance at the newest unfinished call, never a history list.
+// When it finishes, another concurrent call can become the hint; none means clear.
+func (t *cursorToolTracker) snapshot() []LiveToolView {
+	if t != nil {
+		for i := len(t.order) - 1; i >= 0; i-- {
+			call := t.calls[t.order[i]]
+			if !call.finished {
+				return []LiveToolView{{Tool: call.tool,
+					Summary: cursorToolSummary(call.tool, call.args), Status: "running"}}
+			}
 		}
 	}
-	return n
-}
-
-// finish writes the transcript lines for the turn, in call order.
-//
-// It is called once, after the assistant message has been committed — never while
-// the turn is still streaming. pig appends a session entry the moment it is asked
-// to, and commits the turn's message at the end of the turn, so an entry written
-// mid-turn lands *above* the thinking and text it was interleaved with. A real
-// session showed nine shell calls stacked over a message that described them,
-// which reads as tools running in the middle of a thought. Below the message they
-// read as what they are: the activity of that turn, in order.
-//
-// Calls that never reported a result are written as "no result" rather than
-// dropped: an interrupted turn is exactly the case worth seeing.
-func (t *cursorToolTracker) finish() {
-	if t == nil {
-		return
-	}
-	for _, id := range t.order {
-		call := t.calls[id]
-		if !call.finished && call.endedAt.IsZero() {
-			call.endedAt = time.Now()
-		}
-		t.write(call)
-	}
+	return nil
 }
 
 // backgroundToken is the theme token whose colour the host gives a tool card with
@@ -164,26 +125,6 @@ func paintCursorToolLine(line string, width int, bg func(string) string) string 
 		line += strings.Repeat(" ", room)
 	}
 	return bg(line)
-}
-
-func (t *cursorToolTracker) write(call *cursorToolCall) {
-	if t == nil || t.wrote[call.id] {
-		return
-	}
-	t.wrote[call.id] = true
-	entry := call.entry()
-	data, err := json.Marshal(entry)
-	if err == nil {
-		var doc map[string]any
-		err = json.Unmarshal(data, &doc)
-		if err == nil {
-			err = t.appendEntry(doc)
-		}
-	}
-	if err != nil {
-		// A missing line is not worth failing a turn over; the log says which one.
-		t.log.Debug("cursor tool entry rejected", "tool", call.tool, "err", err.Error())
-	}
 }
 
 // cursorToolEntry is the persisted record: enough to re-render the line for any
@@ -635,8 +576,8 @@ func withCardPadding(lines []string) []string {
 	return append(out, "")
 }
 
-// LiveToolView is one Cursor-side call as it stands right now, for a host UI that
-// shows it while the turn streams. Status is "running", "completed" or "failed".
+// LiveToolView describes the one running hint above the editor. Finished calls
+// remain inline in the message and are excluded from the live snapshot.
 type LiveToolView struct {
 	Tool    string
 	Summary string
@@ -644,43 +585,8 @@ type LiveToolView struct {
 	Seconds int
 }
 
-// liveToolLimit is how many cards the live widget shows. A turn can run dozens of
-// calls; the widget is a glance, not a log — the transcript keeps the whole list.
-const liveToolLimit = 6
-
-// snapshot returns this turn's calls in order, as the live widget should draw them.
-// Running calls are last, because that is where the reader's eye needs to be.
-func (t *cursorToolTracker) snapshot() []LiveToolView {
-	if t == nil {
-		return nil
-	}
-	out := make([]LiveToolView, 0, len(t.order))
-	for _, id := range t.order {
-		call := t.calls[id]
-		view := LiveToolView{Tool: call.tool, Summary: cursorToolSummary(call.tool, call.args)}
-		switch {
-		case !call.finished:
-			view.Status = "running"
-		case call.isError:
-			view.Status = "failed"
-			view.Seconds = call.entry().Seconds
-		default:
-			view.Status = "completed"
-			view.Seconds = call.entry().Seconds
-		}
-		out = append(out, view)
-	}
-	if len(out) > liveToolLimit {
-		out = out[len(out)-liveToolLimit:]
-	}
-	return out
-}
-
-// RenderLiveToolCards draws those calls for a widget above the editor: one card
-// row each, in call order, painted with the same background a host tool card gets
-// for that outcome. A finished call turns from the pending colour to the success
-// colour where it stands, which is what makes the widget read as tools running
-// rather than as a status line.
+// RenderLiveToolCards draws only the current running hint, never call history.
+// The transcript already contains each call at its start boundary.
 func RenderLiveToolCards(calls []LiveToolView, theme sdk.UITheme, width int) []string {
 	if len(calls) == 0 {
 		return nil
@@ -692,8 +598,12 @@ func RenderLiveToolCards(calls []LiveToolView, theme sdk.UITheme, width int) []s
 		return theme.Fg(token, text)
 	}
 	out := make([]string, 0, len(calls))
-	for _, view := range calls {
-		card := cursorToolCard{tool: view.Tool, summary: view.Summary, status: view.Status, seconds: view.Seconds}
+	for i := len(calls) - 1; i >= 0; i-- {
+		view := calls[i]
+		if view.Status != "running" {
+			continue
+		}
+		card := cursorToolCard{tool: oneLine(view.Tool), summary: oneLine(view.Summary), status: view.Status, seconds: view.Seconds}
 		lines := cursorToolLines(card, color, false, width)
 		token := card.backgroundToken()
 		if ansi, err := theme.GetBgAnsi(token); err == nil && strings.Contains(ansi, "48") {
@@ -702,15 +612,12 @@ func RenderLiveToolCards(calls []LiveToolView, theme sdk.UITheme, width int) []s
 			}
 		}
 		out = append(out, lines...)
+		break // a caller cannot turn this hint back into a history list
 	}
 	return out
 }
 
-// cursorToolHint is the live footer line for a call still running. It is the only
-// sign of Cursor-side work while the turn streams: the transcript lines are
-// written when the turn ends, because anything appended mid-turn would land above
-// the message it belongs to. So the footer also counts what has already finished,
-// which is what tells a reader the turn is making progress and not stuck.
+// cursorToolHint mirrors the currently running call in the compact footer.
 func cursorToolHint(tool, summary string, done int) string {
 	head := "Cursor running " + tool
 	if summary != "" {

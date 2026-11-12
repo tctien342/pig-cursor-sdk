@@ -1,9 +1,6 @@
 package provider
 
 import (
-	"errors"
-	"io"
-	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -14,14 +11,6 @@ import (
 )
 
 func colorIdentity(_ string, text string) string { return text }
-
-// discardLogger keeps the tests' output to the assertions they make.
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-// errRejected stands in for the host refusing an entry.
-var errRejected = errors.New("host refused the entry")
 
 func cardOf(tool, summary, status string, seconds int) cursorToolCard {
 	return cursorToolCard{tool: tool, summary: summary, status: status, seconds: seconds, detail: "command: " + summary}
@@ -132,98 +121,6 @@ func TestCursorToolExpandedAddsArguments(t *testing.T) {
 	}
 }
 
-// The entry is written once per call and survives the JSON round trip through the
-// session file, because a resumed session re-renders it from stored data alone.
-func TestTrackerWritesOneEntryPerCall(t *testing.T) {
-	var written []map[string]any
-	tr := &cursorToolTracker{
-		appendEntry: func(data map[string]any) error { written = append(written, data); return nil },
-		log:         discardLogger(),
-		calls:       map[string]*cursorToolCall{},
-		wrote:       map[string]bool{},
-	}
-	start := func(id, tool string) cursor.RunEvent {
-		return cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolStarted,
-			ToolCall: &cursor.ToolCallEvent{ID: id, ToolName: tool, Args: map[string]any{"command": "ls -1"}, Status: "running"}}}
-	}
-	done := func(id, tool, status string, isError bool) cursor.RunEvent {
-		return cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolCompleted,
-			ToolCall: &cursor.ToolCallEvent{ID: id, ToolName: tool, Args: map[string]any{"command": "ls -1"}, Status: status, IsError: isError}}}
-	}
-	// The live stream reports the same call twice through two envelopes.
-	tr.note(start("call_a", "shell"))
-	tr.note(start("call_a", "shell"))
-	tr.note(done("call_a", "shell", "completed", false))
-	tr.note(done("call_a", "shell", "completed", false))
-	// And this one never came back.
-	tr.note(start("call_b", "read"))
-	tr.finish()
-
-	if len(written) != 2 {
-		t.Fatalf("wrote %d entries, want one per call: %v", len(written), written)
-	}
-	if got := firstString(written[0], "status"); got != "completed" {
-		t.Errorf("first entry status = %q, want completed", got)
-	}
-	if got := firstString(written[1], "status"); got != "unfinished" {
-		t.Errorf("second entry status = %q, want unfinished", got)
-	}
-	if got := firstString(written[0], "tool"); got != "shell" {
-		t.Errorf("entry tool = %q, want shell", got)
-	}
-
-	// A failed call is stored as failed and renders as failed.
-	written = nil
-	tr2 := &cursorToolTracker{
-		appendEntry: func(data map[string]any) error { written = append(written, data); return nil },
-		log:         discardLogger(),
-		calls:       map[string]*cursorToolCall{},
-		wrote:       map[string]bool{},
-	}
-	tr2.note(start("call_c", "shell"))
-	tr2.note(done("call_c", "shell", "error", true))
-	tr2.finish()
-	if len(written) != 1 || firstString(written[0], "status") != "failed" {
-		t.Fatalf("failed call stored as %v, want status failed", written)
-	}
-	card, ok := parseCursorToolEntry(map[string]any{"data": written[0]})
-	if !ok {
-		t.Fatal("a persisted entry must parse back into a card")
-	}
-	line := cursorToolLines(card, colorIdentity, false, 110)[0]
-	if !strings.Contains(line, "failed") {
-		t.Errorf("rendered failed call = %q", line)
-	}
-}
-
-// The lines are written once the assistant message is committed, never during the
-// turn: pig appends an entry immediately and commits the message at the end, so a
-// line written mid-turn lands above the thinking and text it was interleaved with.
-func TestTrackerWritesNothingUntilTheTurnIsCommitted(t *testing.T) {
-	var written []map[string]any
-	tr := &cursorToolTracker{
-		appendEntry: func(data map[string]any) error { written = append(written, data); return nil },
-		log:         discardLogger(),
-		calls:       map[string]*cursorToolCall{},
-		wrote:       map[string]bool{},
-	}
-	tr.note(cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolStarted,
-		ToolCall: &cursor.ToolCallEvent{ID: "a", ToolName: "shell", Status: "running"}}})
-	tr.note(cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolCompleted,
-		ToolCall: &cursor.ToolCallEvent{ID: "a", ToolName: "shell", Status: "completed"}}})
-	if len(written) != 0 {
-		t.Fatalf("a call must not be written while the turn is streaming, got %v", written)
-	}
-	tr.finish()
-	if len(written) != 1 {
-		t.Fatalf("finish should write the finished call, got %v", written)
-	}
-	tr.finish()
-	if len(written) != 1 {
-		t.Fatalf("finish must not write a call twice, got %v", written)
-	}
-}
-
 // A tool line carries its outcome's background, filled to the full width like a
 // host tool card.
 func TestPaintCursorToolLineFillsTheWidth(t *testing.T) {
@@ -290,19 +187,6 @@ func TestCursorToolBackgroundMatchesOutcome(t *testing.T) {
 	}
 }
 
-// A rejected host call must not take the turn down with it.
-func TestTrackerSurvivesARejectedEntry(t *testing.T) {
-	tr := &cursorToolTracker{
-		appendEntry: func(map[string]any) error { return errRejected },
-		log:         discardLogger(),
-		calls:       map[string]*cursorToolCall{},
-		wrote:       map[string]bool{},
-	}
-	tr.note(cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolCompleted,
-		ToolCall: &cursor.ToolCallEvent{ID: "x", ToolName: "shell", Status: "completed"}}})
-	tr.finish()
-}
-
 // A duration is only shown when it was actually measured between two events.
 func TestCursorToolDurationOnlyWhenMeasured(t *testing.T) {
 	call := &cursorToolCall{id: "x", tool: "shell", startedAt: time.Now().Add(-2600 * time.Millisecond), endedAt: time.Now(), finished: true}
@@ -315,68 +199,30 @@ func TestCursorToolDurationOnlyWhenMeasured(t *testing.T) {
 	}
 }
 
-// The live widget has to say "running" for the call that is still going, keep call
-// order, and stay short enough to sit above the editor.
-func TestLiveToolSnapshotMarksTheRunningCall(t *testing.T) {
-	tr := &cursorToolTracker{
-		appendEntry: func(map[string]any) error { return nil },
-		log:         discardLogger(),
-		calls:       map[string]*cursorToolCall{},
-		wrote:       map[string]bool{},
+// Only the newest unfinished call is a live hint. Completed calls never form a
+// list near the usage bar; all history stays inline in the chat.
+func TestLiveToolSnapshotOnlyRunning(t *testing.T) {
+	tr := &cursorToolTracker{calls: map[string]*cursorToolCall{}}
+	note := func(id string, kind cursor.EventKind) {
+		tr.note(cursor.RunEvent{Event: cursor.Event{Kind: kind, ToolCall: &cursor.ToolCallEvent{
+			ID: id, ToolName: "shell", Args: map[string]any{"command": "echo " + id},
+		}}})
 	}
-	start := func(id, tool string, args map[string]any) cursor.RunEvent {
-		return cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolStarted,
-			ToolCall: &cursor.ToolCallEvent{ID: id, ToolName: tool, Args: args, Status: "running"}}}
+	note("a", cursor.EventCursorToolStarted)
+	note("b", cursor.EventCursorToolStarted)
+	if got := tr.snapshot(); len(got) != 1 || got[0].Summary != "echo b" || got[0].Status != "running" {
+		t.Fatalf("want only newest running call, got %+v", got)
 	}
-	done := func(id, tool string, isError bool) cursor.RunEvent {
-		return cursor.RunEvent{Event: cursor.Event{Kind: cursor.EventCursorToolCompleted,
-			ToolCall: &cursor.ToolCallEvent{ID: id, ToolName: tool, Status: "completed", IsError: isError}}}
+	note("b", cursor.EventCursorToolCompleted)
+	if got := tr.snapshot(); len(got) != 1 || got[0].Summary != "echo a" {
+		t.Fatalf("older concurrent call should become the hint: %+v", got)
 	}
-	tr.note(start("a", "shell", map[string]any{"command": "ls -1"}))
-	tr.note(done("a", "shell", false))
-	tr.note(start("b", "grep", map[string]any{"pattern": "deferPlanWork"}))
-	tr.note(done("b", "grep", true))
-	tr.note(start("c", "read", map[string]any{"path": "src/x.go"}))
-
-	views := tr.snapshot()
-	if len(views) != 3 {
-		t.Fatalf("want three calls, got %+v", views)
+	note("a", cursor.EventCursorToolCompleted)
+	if got := tr.snapshot(); len(got) != 0 {
+		t.Fatalf("completed calls must clear the hint: %+v", got)
 	}
-	if views[0].Status != "completed" || views[0].Summary != "ls -1" {
-		t.Errorf("first call = %+v", views[0])
-	}
-	if views[1].Status != "failed" || views[1].Summary != "deferPlanWork" {
-		t.Errorf("failed call = %+v", views[1])
-	}
-	if views[2].Status != "running" || views[2].Tool != "read" {
-		t.Errorf("the running call must stay last and say so: %+v", views[2])
-	}
-	if got := tr.done(); got != 2 {
-		t.Errorf("done = %d, want 2", got)
-	}
-
-	// A burst is capped: the widget is a glance, not the log.
-	for i := 0; i < 10; i++ {
-		id := string(rune('d' + i))
-		tr.note(start(id, "shell", map[string]any{"command": "echo " + id}))
-	}
-	if got := len(tr.snapshot()); got != liveToolLimit {
-		t.Fatalf("snapshot should cap at %d, got %d", liveToolLimit, got)
-	}
-	last := tr.snapshot()[liveToolLimit-1]
-	if last.Status != "running" {
-		t.Errorf("the newest call must survive the cap, got %+v", last)
-	}
-
-	// A card drawn for the widget is one row and carries the running word.
-	lines := RenderLiveToolCards(views, sdk.UITheme{}, 100)
-	if len(lines) != 3 {
-		t.Fatalf("want one row per call, got %d: %q", len(lines), lines)
-	}
-	if !strings.Contains(lines[2], "running") {
-		t.Errorf("the running card should say running: %q", lines[2])
-	}
-	if strings.Contains(lines[0], "running") {
-		t.Errorf("a finished card must not say running: %q", lines[0])
+	lines := RenderLiveToolCards([]LiveToolView{{Tool: "shell", Summary: "echo a", Status: "running"}}, sdk.UITheme{}, 100)
+	if len(lines) != 1 || !strings.Contains(lines[0], "running") {
+		t.Fatalf("want one running line: %q", lines)
 	}
 }

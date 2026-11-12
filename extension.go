@@ -50,9 +50,7 @@ type state struct {
 	planAnim   uint64    // stale-animation guard
 	planWarn   sync.Once // "no data" is worth saying once per session
 
-	// Live Cursor-side tool cards, above the editor, while a turn streams. The
-	// transcript cannot show them yet (an entry appended mid-turn lands above the
-	// message), so this is what makes the calls visible while they happen.
+	// One running hint above the editor; completed calls remain only inline.
 	liveTools  []provider.LiveToolView
 	liveCtx    *sdk.Context // newest context the live widget may read through
 	liveRender func(int) []string
@@ -75,9 +73,8 @@ func Extension() *sdk.Extension {
 	// `pig --list-models cursor` works without a bridge or the network.
 	e.RegisterProvider(providerID, st.providerConfig(st.startupModels()))
 
-	// Cursor's own tool calls (its built-in shell, reader, search) have no host
-	// tool behind them, so the extension draws their transcript line itself. One
-	// registration covers live turns and the replay of a resumed session.
+	// Retain the custom-entry renderer for sessions written by older releases.
+	// New internal-tool annotations are plain inline assistant text.
 	e.EntryRenderer(provider.CursorToolEntryType, provider.RenderCursorToolEntry)
 
 	e.Command("cursor-refresh-models", "Refresh the live Cursor model catalog without restarting pig.", func(ctx sdk.Context, args string) error {
@@ -787,13 +784,8 @@ func limitWindow(eng *provider.Engine) string {
 
 const toolsWidgetKey = "cursor-tools"
 
-// pushLiveTools draws the turn's Cursor-side calls above the editor while the turn
-// streams, and clears the widget when the turn ends.
-//
-// This exists because the transcript cannot: pig commits an assistant message at
-// the end of the turn, so an entry appended while it streams lands above that
-// message. A widget is the one surface that can show "shell · git diff …" *now*
-// and then be replaced by the same cards in the transcript.
+// pushLiveTools shows one currently running call above the editor. History is
+// already inline in the assistant message, never collected near the usage bar.
 func (s *state) pushLiveTools(ctx sdk.Context, calls []provider.LiveToolView) {
 	if os.Getenv("PI_CURSOR_SHOW_TOOLS") == "0" {
 		return // same switch that turns the transcript cards off

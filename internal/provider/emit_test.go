@@ -98,10 +98,9 @@ func TestEmitsOnlyTextThinkingAndHostToolCalls(t *testing.T) {
 		t.Fatalf("want one thinking and one text block, got %v", roles)
 	}
 
-	// Cursor's own tool activity never becomes a provider event or message
-	// content: it is displayed as a session entry instead (see cursortools.go),
-	// and this test is the guarantee that the transcript path stays clean even if
-	// the tagging in the run stream ever misses one.
+	// Untagged unknown calls remain suppressed as a safety backstop. Only the
+	// explicit cursor-tool event kinds produce inline annotations; neither path
+	// may inject raw result dumps or become executable host tool calls.
 	joined := em.text() + thinkingText(t, msg)
 	for _, banned := range []string{"$ echo hi", "call_cursor_shell", "Shell", "tool_call", "\"type\""} {
 		if strings.Contains(joined, banned) {
