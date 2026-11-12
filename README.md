@@ -58,7 +58,7 @@ is used automatically. Cursor Desktop's subscription login does **not** provide 
 key usable here. Missing pieces say so plainly: no key → run `/cursor-login`; no
 bridge → the exact path to put it at.
 
-Verified from a clean clone on 2026-06-08: `pig install --validate-only
+Verified from a clean clone: `pig install --validate-only
 git:github.com/tctien342/pig-cursor-sdk` → valid, provider `cursor`, five
 commands; `scripts/install-bridge.sh` → `v1.2.0`, checksum verified, and a real
 turn served by that freshly downloaded bridge.
