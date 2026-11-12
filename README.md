@@ -274,3 +274,16 @@ cd dev && cd dev && go run ./cmd/planprobe  # plan numbers + timings, without st
   publishes token counts, not a per-run dollar amount.
 - Cursor's own account usage/quota is not exposed by `sdk.v1`, so there is no
   quota readout to show.
+
+## Handler rule: never call back into pig from an event handler
+
+`session_start` (and every other handler) runs while pig is waiting for its result.
+A handler that sends a request *back* to pig — `SetWidgetRenderer`, `SetStatus`, or
+anything that reaches the network before answering — is waiting on a host that is
+waiting on it. The handler never returns, so the provider is never registered: the
+`/cursor*` commands disappear, `cursor/*` models stop resolving, and chat fails with
+"model not found", with no error anywhere except one line in the extension's stderr
+log: `extension handlers did not stop before the shutdown deadline`.
+
+Plan reads (which call Cursor) and every widget push therefore run on a single
+deferred worker (`state.deferPlanWork`), not inside the handler.

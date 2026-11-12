@@ -48,6 +48,8 @@ type state struct {
 	planPct    float64
 	planAnim   uint64    // stale-animation guard
 	planWarn   sync.Once // "no data" is worth saying once per session
+	planWant   int64     // deferred plan work requested
+	planDone   int64     // ...and completed, so repeat turns cannot stack
 }
 
 // Extension is pig's standard Go factory entry point.
@@ -151,13 +153,7 @@ func Extension() *sdk.Extension {
 	})
 
 	e.OnEvent("turn_end", func(ctx sdk.Context, _ map[string]any) (any, error) {
-		before := st.planPct
-		if snap := st.refreshPlan(false); snap != nil {
-			if provider.PercentChanged(before, snapPercent(snap)) {
-				st.animatePlanBar(ctx, snap)
-			}
-		}
-		st.syncPlanBar(ctx)
+		st.deferPlanWork(ctx, "turn_end")
 		// Account totals cost a fan-out over agents, so refresh at most every
 		// PI_CURSOR_ACCOUNT_TTL_S (3 min default) and skip the wait otherwise.
 		st.refreshAccount(ctx, false)
@@ -218,11 +214,12 @@ func Extension() *sdk.Extension {
 
 	e.OnSessionStart(func(ctx sdk.Context, _ map[string]any) (any, error) {
 		st.configure(ctx)
-		if snap := st.refreshPlan(true); snap != nil {
-			st.setPlanPct(snap)
-		}
-		st.syncPlanBar(ctx)
 		st.refreshStatus(ctx)
+		// Never call the host from inside this handler. The host is waiting for the
+		// handler's result, and ui.setWidget / the plan read (which reaches Cursor)
+		// both go back out over the same connection: called inline the handler never
+		// returns, the provider is never registered, and the model vanishes.
+		st.deferPlanWork(ctx, "session_start")
 		return nil, nil
 	})
 
@@ -921,5 +918,40 @@ func (s *state) animatePlanBar(ctx sdk.Context, snap *planusage.Snapshot) {
 		}
 		s.mu.Unlock()
 		_ = ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"})
+	}()
+}
+
+// deferPlanWork runs the plan read and the bar's host calls outside the event
+// handler that asked for them, on a single worker so repeated turns cannot stack.
+// The extension stays active after a handler returns, so the context is still
+// usable; what is not allowed is calling back into the host while the host is
+// blocked on that same handler.
+func (s *state) deferPlanWork(ctx sdk.Context, reason string) {
+	s.mu.Lock()
+	s.planWant++
+	want := s.planWant
+	ran := s.planDone
+	s.mu.Unlock()
+	if ran >= want {
+		return
+	}
+	go func() {
+		s.mu.Lock()
+		if s.planDone >= want {
+			s.mu.Unlock()
+			return
+		}
+		s.planDone = want
+		s.mu.Unlock()
+
+		before := s.planPct
+		snap := s.refreshPlan(reason == "session_start")
+		if snap != nil {
+			s.setPlanPct(snap)
+		}
+		s.syncPlanBar(ctx)
+		if snap != nil && provider.PercentChanged(before, snapPercent(snap)) {
+			s.animatePlanBar(ctx, snap)
+		}
 	}()
 }

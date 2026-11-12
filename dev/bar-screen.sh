@@ -1,34 +1,46 @@
 #!/usr/bin/env bash
-# Is the plan bar actually painted? Start pig with a Cursor model, sit idle, and
-# record the screen with the harness that is known to work (pty.fork gives the
-# child a controlling terminal; openpty+setsid does not, and pig's TUI exits after
-# its first frame). Raw bytes are appended as they arrive, so a killed run still
-# leaves evidence.
+# How long until the extension is actually running, and is the bar on screen then?
+# A blind timer kept measuring pig's compile step, not the UI, so this watches the
+# extension's own log and only starts interacting once the extension has spoken.
 set -uo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 RAW=/tmp/pi-bar-raw.log
-CAP=/tmp/pi-bar-session.txt
-rm -f "$RAW" "$CAP"; : > "$RAW"
+LOG="$HOME/.pig/agent/pig-cursor-sdk/agent.log"
+rm -f "$RAW"; : > "$RAW"
+: > /tmp/pi-bar-marker
+BEFORE=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0)
 
-python3 - <<'EOF'
-import json, os, pty, select, time
+python3 - "$BEFORE" "$LOG" <<'EOF'
+import fcntl, json, os, pty, re, select, struct, sys, termios, time
+
+before, logpath = int(sys.argv[1]), sys.argv[2]
 key = None
 try:
     key = json.load(open(os.path.expanduser("~/.pig/agent/auth.json")))["cursor"]["key"]
 except Exception:
     pass
 env = dict(os.environ, CURSOR_API_KEY=key or "", TERM="xterm-256color", PI_CURSOR_GO_DEBUG="1")
-pid, fd = pty.fork()   # pty.fork returns (pid, fd), not (fd, pid)
+
+t0 = time.time()
+pid, fd = pty.fork()          # (pid, fd); gives the child a controlling terminal
 if pid == 0:
     os.execvpe("pig", ["pig", "-e", ".", "--model", "cursor/grok-4.7"], env)
     os._exit(127)
-import fcntl, struct, termios
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))  # rows, cols
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))
 out = open("/tmp/pi-bar-raw.log", "ab")
-deadline = time.time() + 120
-t0 = time.time()
-exited = False
+
+def logtail():
+    try:
+        lines = open(logpath, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return []
+    return lines[before:]
+
+loaded = None
+bar = None
+typed = 0
+deadline = t0 + 300
 while time.time() < deadline:
     r, _, _ = select.select([fd], [], [], 0.3)
     if r:
@@ -39,9 +51,23 @@ while time.time() < deadline:
         if not data:
             break
         out.write(data); out.flush()
-    if not exited and time.time() - t0 > 100:
-        os.write(fd, b"/cursor-usage\r"); time.sleep(3)
-        os.write(fd, b"/exit\r"); exited = True
+    tail = logtail()
+    if loaded is None and tail:
+        loaded = time.time() - t0
+        print(f"extension logged after {loaded:.1f}s: {tail[-1][:110]}", flush=True)
+    if bar is None:
+        hit = [l for l in tail if "plan bar" in l]
+        if hit:
+            bar = time.time() - t0
+            print(f"plan bar logged after {bar:.1f}s: {hit[-1].split('msg=')[-1][:120]}", flush=True)
+    # Once the extension is up, ask for the readout so the widget has a reason to
+    # repaint, then stop shortly after.
+    if loaded and bar and typed < 2 and time.time() - t0 > bar + 6 + typed * 4:
+        os.write(fd, b"/cursor-usage\r" if typed == 0 else b"/exit\r")
+        typed += 1
+    if typed >= 2 and time.time() - t0 > bar + 20:
+        break
+print(f"capture: {os.path.getsize('/tmp/pi-bar-raw.log')} bytes over {time.time()-t0:.0f}s", flush=True)
 out.close()
 try:
     os.write(fd, b"\x03")
@@ -60,17 +86,9 @@ except Exception:
     pass
 EOF
 
-python3 dev/clean_ansi.py < "$RAW" > "$CAP" 2>/dev/null || cp "$RAW" "$CAP"
-
-echo "capture bytes: $(wc -c < "$RAW" | tr -d ' ')"
-echo "=== is the bar on the rendered screen? (pyte replay, not a grep) ==="
-if [ -x dev/.venv/bin/python ]; then
-  dev/.venv/bin/python dev/screen-state.py '▰|▱' "$RAW"
-else
-  echo "  dev/.venv missing: python3 -m venv dev/.venv && dev/.venv/bin/pip install pyte"
-fi
-echo "=== extension's own account of it ==="
-grep -aE "plan bar" ~/.pig/agent/pig-cursor-sdk/agent.log | tail -4 | sed 's/time=[^ ]* //' | cut -c1-150
-echo "=== last screen frame ==="
-grep -av '^[[:space:]]*$' "$CAP" | tail -10 | cut -c1-112
-cp "$CAP" docs/research/tty-bar.txt
+echo "=== extension's account of the bar ==="
+grep -aE "plan bar" "$LOG" | tail -4 | sed 's/time=[^ ]* //' | cut -c1-150
+echo "=== is the bar on the rendered screen? ==="
+dev/.venv/bin/python dev/screen-state.py '▰|▱|PI-WIDGET' /tmp/pi-bar-raw.log
+echo "=== what is on screen ==="
+dev/.venv/bin/python dev/screen-state.py '.' /tmp/pi-bar-raw.log 2>/dev/null | tail -8 | cut -c1-112
