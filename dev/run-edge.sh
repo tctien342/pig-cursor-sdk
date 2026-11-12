@@ -6,9 +6,12 @@ cd "$(dirname "$0")/.."
 KEY=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.pig/agent/auth.json')))['cursor']['key'])")
 export CURSOR_API_KEY="$KEY"
 OUT=/tmp/pig-cursor-edge
+TOOLCALLS="$(cd "$(dirname "$0")" && pwd)/toolcalls.py"
 mkdir -p "$OUT"
 
 echo "== 1. two host tool calls in one turn"
+LOG=~/.pig/agent/pig-cursor-sdk/agent.log
+mark_before=$(wc -l < "$LOG" | tr -d ' ')
 pig --model cursor/grok-4.7 --mode json --no-session -p \
   "Call the bash tool twice, both calls in the same response: run 'echo one' and run 'echo two'. Then tell me both outputs." \
   >"$OUT/two-calls.jsonl" 2>"$OUT/two-calls.err"
@@ -38,9 +41,9 @@ print("   toolCall blocks:", dict(calls), "distinct ids:", len(set(ids)))
 print("   host executions:", len(execs), execs)
 print("   turns:", turns)
 PY
-echo "   exactly-once log (park vs delivery must match per id):"
-grep -c "host tool call parked" ~/.pig/agent/pig-cursor-sdk/agent.log | sed 's/^/     parked:   /'
-grep -c "host tool result delivered" ~/.pig/agent/pig-cursor-sdk/agent.log | sed 's/^/     delivery: /'
+echo "   exactly-once log, this run only (one park and one delivery per id):"
+tail -n +$((mark_before + 1)) "$LOG" > "$OUT/turn.log"
+python3 "$TOOLCALLS" "$OUT/turn.log"
 
 echo
 echo "== 2. killed host must not orphan the bridge"

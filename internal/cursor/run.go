@@ -532,6 +532,15 @@ func (r *Run) Next(ctx context.Context) (RunEvent, bool) {
 	return r.queue.pop(ctx, r.ctx)
 }
 
+// NextWithin waits up to wait for the next event. ok=false means either the
+// wait expired or the stream ended; callers that use it to close a bounded
+// window treat both the same way.
+func (r *Run) NextWithin(ctx context.Context, wait time.Duration) (RunEvent, bool) {
+	tctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	return r.queue.pop(tctx, r.ctx)
+}
+
 // NextReady returns the next event without blocking.
 func (r *Run) NextReady() (RunEvent, bool) { return r.queue.popReady() }
 

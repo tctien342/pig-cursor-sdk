@@ -113,6 +113,37 @@ func TestEmitsOnlyTextThinkingAndHostToolCalls(t *testing.T) {
 	}
 }
 
+// A Cursor turn can batch several host tool calls. Handing back only the first
+// would leave Cursor waiting for a result that never arrives, so every call in
+// the batch must become its own card with its own id.
+func TestBatchedHostToolCallsAllReachTheHost(t *testing.T) {
+	em := newTurnEmitter(modelMap(), entryFor())
+	em.begin()
+	em.add(hostCall("call_a", "bash", map[string]any{"command": "echo one"}))
+	em.add(hostCall("call_b", "bash", map[string]any{"command": "echo two"}))
+	em.finish("toolUse", nil)
+
+	var ids []string
+	for _, blk := range em.p.msg["content"].([]any) {
+		m, _ := blk.(map[string]any)
+		if firstString(m, "type") == "toolCall" {
+			ids = append(ids, firstString(m, "id"))
+		}
+	}
+	if len(ids) != 2 || ids[0] != "call_a" || ids[1] != "call_b" {
+		t.Fatalf("tool card ids = %v, want [call_a call_b] in arrival order", ids)
+	}
+	if len(em.pending) != 2 {
+		t.Fatalf("pending host calls = %d, want 2 so both results get delivered on resume", len(em.pending))
+	}
+	if got := em.pending[1].ToolName; got != "bash" {
+		t.Fatalf("pending[1] tool = %q, want bash", got)
+	}
+	if em.p.msg["stopReason"] != "toolUse" {
+		t.Fatalf("stopReason = %v, want toolUse", em.p.msg["stopReason"])
+	}
+}
+
 func TestHostToolCardCarriesRealNameAndArgs(t *testing.T) {
 	em := newTurnEmitter(modelMap(), entryFor())
 	em.begin()

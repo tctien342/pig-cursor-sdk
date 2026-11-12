@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -480,8 +481,20 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 	turnCtx, cancelTurn := context.WithTimeout(goCtx(ctx), e.turnDeadline())
 	defer cancelTurn()
 
+	// A host tool call ends the turn — but Cursor may batch several calls in one
+	// turn, and pig runs every call we hand back. So after the first call keep
+	// reading for a short quiet window to catch the rest of the batch, then park.
+	// Dropping the tail leaves Cursor waiting for a result that never arrives.
+	hosted := false
+	grace := e.batchGrace()
 	for {
-		ev, ok := run.Next(turnCtx)
+		var ev cursor.RunEvent
+		var ok bool
+		if hosted {
+			ev, ok = run.NextWithin(turnCtx, grace)
+		} else {
+			ev, ok = run.Next(turnCtx)
+		}
 		if !ok {
 			break
 		}
@@ -493,11 +506,18 @@ func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model ma
 			return turnOutcome{}
 		}
 		if em.add(ev) {
-			// This turn is over: pig runs the tool and calls back with the result,
-			// which resumes the run. No stream is kept open in between.
-			run.PauseStream()
+			hosted = true
+			continue
+		}
+		if hosted && ev.Kind == cursor.EventStatus && ev.Status != nil && ev.Status.Status == "tool_pending" {
+			// Cursor is blocked on our callbacks now: the batch is complete.
 			break
 		}
+	}
+	if hosted {
+		// This turn is over: pig runs the tools and calls back with the results,
+		// which resumes the run. No stream is kept open in between.
+		run.PauseStream()
 	}
 
 	if err := run.DrainErr(); err != nil {
@@ -974,6 +994,17 @@ func toolNameSet(tools []ToolDef) map[string]bool {
 
 // turnDeadline bounds one provider turn. A Cursor run that stops producing
 // events must not leave pig waiting forever behind a spinner.
+// batchGrace is how long to keep the stream open after a host tool call to catch
+// the rest of a batched turn.
+func (e *Engine) batchGrace() time.Duration {
+	if v := os.Getenv("PI_CURSOR_TOOL_BATCH_GRACE_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms >= 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return 900 * time.Millisecond
+}
+
 func (e *Engine) turnDeadline() time.Duration {
 	if v := os.Getenv("PI_CURSOR_TURN_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {

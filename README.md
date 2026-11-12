@@ -83,9 +83,10 @@ maps onto the model's own reasoning parameter.
 | `/cursor-login` | store an API key |
 
 Environment: `CURSOR_SDK_BRIDGE_BIN` (bridge path), `PI_CURSOR_TURN_TIMEOUT`
-(default `5m`), `PI_CURSOR_GO_DEBUG=1` (debug logging to
-`~/.pig/agent/pig-cursor-sdk/agent.log`), `PI_CURSOR_SETTING_SOURCES`,
-`PI_CURSOR_FOOTER=0`.
+(default `5m`), `PI_CURSOR_TOOL_BATCH_GRACE_MS` (how long to keep reading after a
+host tool call to catch a batched turn, default `900`), `PI_CURSOR_GO_DEBUG=1`
+(debug logging to `~/.pig/agent/pig-cursor-sdk/agent.log`),
+`PI_CURSOR_SETTING_SOURCES`, `PI_CURSOR_FOOTER=0`.
 
 ## How tool calls are displayed
 

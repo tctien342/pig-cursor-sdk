@@ -53,6 +53,24 @@ into pig provider events, so the rules are one place, testable without a bridge.
 Exactly-once and duplicate-callback behaviour (rule 4) is covered in
 `internal/cursor/run_test.go`.
 
+## A batch of tool calls is one turn
+
+Cursor can ask for several host tools in a single turn, and pig runs every call
+we hand back. So the turn does not end at the first call: after one arrives the
+stream is read for a short quiet window (`PI_CURSOR_TOOL_BATCH_GRACE_MS`,
+default 900 ms) or until Cursor reports `tool_pending`, whichever comes first,
+and the run parks with the whole batch outstanding. Handing back only the first
+call left Cursor waiting for a result that never arrived — measured in
+`dev/run-edge.sh` section 1 before the fix, where two calls were parked and one
+was answered.
+
+Live proof after the fix: `docs/evidence/live-batch-tool-turn.jsonl` (host
+executed `echo one` and `echo two`), and `dev/toolcalls.py` over that run's log
+slice reports one park and one delivery per call id.
+
+`dev/run-edge.sh` also checks that a `SIGTERM`'d host leaves no orphaned bridge:
+bridges before = 0, after = 0.
+
 ## What it replaced
 
 `docs/evidence/current-display-audit.md` measured the previous extension across
