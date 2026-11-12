@@ -255,7 +255,7 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 	// continuation: resolve them and keep streaming the same run. Nothing new
 	// is sent to Cursor, so the model sees its tool output and continues.
 	if resume := e.resumeParked(ctx, sess, client, apiKey, entry, piCtx, debugStream); resume != nil {
-		e.consume(ctx, stream, model, entry, sess, resume, debugStream)
+		e.consume(ctx, stream, model, entry, sess, resume, debugStream, piCtx.Tools)
 		return
 	}
 
@@ -264,7 +264,7 @@ func (e *Engine) pump(ctx sdk.Context, stream *sdk.ModelEventStream, model, piCo
 		e.fail(stream, model, modelID, err)
 		return
 	}
-	e.consume(ctx, stream, model, entry, sess, run, debugStream)
+	e.consume(ctx, stream, model, entry, sess, run, debugStream, piCtx.Tools)
 }
 
 // resumeParked resolves parked host calls from the transcript's tool results
@@ -424,9 +424,20 @@ func (e *Engine) startTurn(ctx sdk.Context, sess *Session, client *cursor.Client
 // consume turns run events into pig provider events. This is the display
 // contract: only assistant text, thinking, and real host tool calls reach the
 // transcript.
-func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool) {
+func (e *Engine) consume(ctx sdk.Context, stream *sdk.ModelEventStream, model map[string]any, entry *ModelEntry, sess *Session, run *cursor.Run, debug bool, tools []ToolDef) {
 	em := newTurnEmitter(model, entry)
 	em.sink = func(ev map[string]any) { stream.Push(ev) }
+	// Cursor's own tool activity is invisible by design; a footer hint is the
+	// honest middle ground between silence and transcript noise.
+	seen := map[string]bool{}
+	em.notice = func(verb, toolName string) {
+		if seen[toolName] {
+			return
+		}
+		seen[toolName] = true
+		ctx.SetStatus("cursor-activity", "Cursor "+verb+" "+toolName+" (its own tool)")
+	}
+	em.hostToolSet = toolNameSet(tools)
 	em.begin()
 
 	turnCtx, cancelTurn := context.WithTimeout(goCtx(ctx), e.turnDeadline())
@@ -883,6 +894,18 @@ func (e *Engine) failWith(stream *sdk.ModelEventStream, p *partial, model map[st
 	p.msg["errorMessage"] = err.Error()
 	stream.Push(map[string]any{"type": "error", "reason": "error", "error": p.msg})
 	stream.End(p.msg)
+}
+
+// toolNameSet is the set of tool names advertised to Cursor for this turn.
+func toolNameSet(tools []ToolDef) map[string]bool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		out[t.Name] = true
+	}
+	return out
 }
 
 // turnDeadline bounds one provider turn. A Cursor run that stops producing

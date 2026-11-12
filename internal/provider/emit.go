@@ -18,9 +18,14 @@ import (
 type turnEmitter struct {
 	p    *partial
 	sink func(map[string]any)
+	// notice reports Cursor-side tool activity: it must never become transcript
+	// content, but "the agent did something I cannot see" deserves a hint, so it
+	// goes to the footer status area instead.
+	notice func(verb, toolName string)
 
-	tools   []map[string]any
-	pending []pendingRef
+	tools       []map[string]any
+	pending     []pendingRef
+	hostToolSet map[string]bool
 }
 
 func newTurnEmitter(model map[string]any, entry *ModelEntry) *turnEmitter {
@@ -78,6 +83,14 @@ func (t *turnEmitter) add(ev cursor.RunEvent) (stop bool) {
 		t.p.appendText(ev.Text)
 		t.push(map[string]any{"type": "text_delta", "contentIndex": idx, "delta": ev.Text})
 	case cursor.EventToolCallStarted:
+		if ev.ToolCall != nil && !t.isHostTool(ev.ToolCall.ToolName) {
+			// Cursor executed one of its own tools. No host card exists for it, so
+			// the transcript stays clean and the footer says so.
+			if t.notice != nil {
+				t.notice("ran", ev.ToolCall.ToolName)
+			}
+			return false
+		}
 		return t.hostToolCall(ev)
 	case cursor.EventUsage:
 		if ev.Usage != nil {
@@ -89,6 +102,15 @@ func (t *turnEmitter) add(ev cursor.RunEvent) (stop bool) {
 		}
 	}
 	return false
+}
+
+// hostTools is the set the agent advertised to Cursor; a name outside it is
+// Cursor's own tool, which the host cannot run or render.
+func (t *turnEmitter) isHostTool(name string) bool {
+	if t.hostToolSet == nil {
+		return true // unknown set: never suppress a card on a guess
+	}
+	return t.hostToolSet[name]
 }
 
 // hostToolCall surfaces one host-owned tool call as a real pig tool call, so the

@@ -116,6 +116,7 @@ go test ./...                     # 22 tests: coordinator, decoder against real 
 pig install . --validate-only --json
 ./dev/run-live.sh cursor/grok-4.7 "Use the bash tool to run exactly: echo hello-go. Then tell me what it printed."
 python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty-session.txt
+./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
 ```
 
 ## Known limitations
@@ -123,9 +124,10 @@ python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty
 - Model aliases the TypeScript extension invented (`auto`, `composer`,
   `fable-5-2@1m`) are not part of `sdk.v1`; only canonical Cursor ids are offered.
 - If Cursor answers with one of *its own* built-in tools instead of a host tool,
-  nothing renders — there is no host tool to attach a card to. Say the word and a
-  footer notice can be added; injecting a transcript line for it is deliberately
-  not the default.
+  no card renders — there is no host tool to attach one to. The footer says
+  `Cursor ran Shell (its own tool)` instead; a transcript line for it would be
+  exactly the noise this extension exists to remove. Disable with
+  `PI_CURSOR_FOOTER=0`.
 - Cost is reported as an estimate of zero with `totalFromProvider: false`: Cursor
   publishes token counts, not a per-run dollar amount.
 - Cursor's own account usage/quota is not exposed by `sdk.v1`, so there is no

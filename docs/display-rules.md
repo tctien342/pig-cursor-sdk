@@ -16,7 +16,9 @@ into pig provider events, so the rules are one place, testable without a bridge.
    which is what the resumed run matches its tool result against.
 3. **The tool channel is never faked.** Cursor's shell/read/write activity, step
    frames, lifecycle chatter, and protocol payloads never enter text or thinking.
-   If a call is not a host tool, it produces no transcript content at all.
+   If a call is not a host tool there is no card the host could attach to, so it
+   produces no transcript content — and it is not silently invisible either: the
+   footer status line says `Cursor ran Shell (its own tool)`, once per tool.
 4. **One card per call, resolved exactly once.** The bridge callback is the
    authoritative record of a host tool call; the stream's own `tool_call` frame
    for the same id is bookkeeping only. A duplicate callback for the same id is
@@ -41,7 +43,7 @@ into pig provider events, so the rules are one place, testable without a bridge.
 
 | rule | test |
 | --- | --- |
-| 1, 3 | `TestEmitsOnlyTextThinkingAndHostToolCalls` |
+| 1, 3 | `TestEmitsOnlyTextThinkingAndHostToolCalls` (also asserts the one footer notice for Cursor's own tool) |
 | 2 | `TestHostToolCardCarriesRealNameAndArgs` |
 | 5 | `TestStreamedTextIsNeverDuplicated` |
 | 6 | `TestResumedTurnStillDeliversTheFinalAnswer` |
