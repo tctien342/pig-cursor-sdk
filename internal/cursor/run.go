@@ -583,6 +583,9 @@ func (r *Run) ResolveHostCall(id string, payload map[string]any, isError bool, n
 	}
 	r.order = rest
 	r.mu.Unlock()
+	if r.agent != nil && r.agent.client != nil && r.agent.client.log != nil {
+		r.agent.client.log.Info("host tool result delivered", "tool", p.ToolName, "id", id, "bytes", len(note))
+	}
 	return true
 }
 
@@ -684,6 +687,11 @@ func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, er
 		},
 		Pending: p,
 	})
+	if r.agent != nil && r.agent.client != nil && r.agent.client.log != nil {
+		// INFO, not debug: "did the host run this tool once or twice?" is a
+		// question worth answering from the default log.
+		r.agent.client.log.Info("host tool call parked", "tool", req.ToolName, "id", id)
+	}
 	if !paused && cancel != nil {
 		// Close the live stream so this provider turn ends; the run keeps waiting
 		// upstream and ObserveRun picks it up with the next request.
