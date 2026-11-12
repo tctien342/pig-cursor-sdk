@@ -40,6 +40,13 @@ type state struct {
 	mode      string // Cursor mode: agent | plan
 	fast      map[string]bool
 	configErr string
+
+	// Plan bar widget: a usage bar above the editor, filled in on read.
+	planRender func(int) []string
+	planPhase  int  // cells the bar may reveal; -1 once settled
+	planShown  bool // widget currently installed for this model
+	planPct    float64
+	planAnim   uint64 // stale-animation guard
 }
 
 // Extension is pig's standard Go factory entry point.
@@ -135,8 +142,21 @@ func Extension() *sdk.Extension {
 	// refreshed when a turn finishes rather than polled.
 	// Plan usage rides on Cursor Desktop's login, so it is read only when that
 	// exists; Check() is a stat plus one indexed key, and the answer is cached.
+	// The bar belongs to a Cursor session only, and the host does not call a
+	// widget renderer when the model changes, so the widget is synced per turn.
+	e.OnEvent("turn_start", func(ctx sdk.Context, _ map[string]any) (any, error) {
+		st.syncPlanBar(ctx)
+		return nil, nil
+	})
+
 	e.OnEvent("turn_end", func(ctx sdk.Context, _ map[string]any) (any, error) {
-		st.refreshPlan(false)
+		before := st.planPct
+		if snap := st.refreshPlan(false); snap != nil {
+			if provider.PercentChanged(before, snapPercent(snap)) {
+				st.animatePlanBar(ctx, snap)
+			}
+		}
+		st.syncPlanBar(ctx)
 		// Account totals cost a fan-out over agents, so refresh at most every
 		// PI_CURSOR_ACCOUNT_TTL_S (3 min default) and skip the wait otherwise.
 		st.refreshAccount(ctx, false)
@@ -197,6 +217,10 @@ func Extension() *sdk.Extension {
 
 	e.OnSessionStart(func(ctx sdk.Context, _ map[string]any) (any, error) {
 		st.configure(ctx)
+		if snap := st.refreshPlan(true); snap != nil {
+			st.setPlanPct(snap)
+		}
+		st.syncPlanBar(ctx)
 		st.refreshStatus(ctx)
 		return nil, nil
 	})
@@ -711,4 +735,146 @@ func limitWindow(eng *provider.Engine) string {
 		return ""
 	}
 	return "limit " + r.Summary(time.Now())
+}
+
+// ---- plan bar widget ------------------------------------------------------
+
+const planWidgetKey = "cursor-plan"
+
+// snapPercent is the percentage the bar shows: Cursor's own figure when it sends
+// one, otherwise the ratio of the included allowance.
+func snapPercent(snap *planusage.Snapshot) float64 {
+	if snap == nil {
+		return 0
+	}
+	if snap.PercentUsed > 0 {
+		return snap.PercentUsed
+	}
+	if snap.IncludedLimit > 0 {
+		return 100 * float64(snap.IncludedSpend) / float64(snap.IncludedLimit)
+	}
+	return 0
+}
+
+func (s *state) setPlanPct(snap *planusage.Snapshot) {
+	s.mu.Lock()
+	s.planPct = snapPercent(snap)
+	s.mu.Unlock()
+}
+
+// syncPlanBar makes the widget match the active model: a Cursor model gets the
+// bar, anything else gets the built-in layout back.
+func (s *state) syncPlanBar(ctx sdk.Context) {
+	if os.Getenv("PI_CURSOR_PLAN_BAR") == "0" {
+		return
+	}
+	wantCursor := strings.HasPrefix(ctx.Model(), providerID+"/")
+	s.mu.Lock()
+	shown := s.planShown
+	s.mu.Unlock()
+	if wantCursor && !shown {
+		s.installPlanBar(ctx)
+	} else if !wantCursor && shown {
+		_ = ctx.SetWidgetRenderer(planWidgetKey, nil)
+		s.mu.Lock()
+		s.planShown = false
+		s.mu.Unlock()
+	}
+}
+
+func (s *state) barShown() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.planShown
+}
+
+func (s *state) installPlanBar(ctx sdk.Context) {
+	if s.planRender == nil {
+		s.planRender = func(width int) []string { return s.planBarLines(ctx, width) }
+	}
+	if err := ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"}); err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.planShown = true
+	s.mu.Unlock()
+}
+
+// planBarLines is one row: label, bar, percentage, and the two facts that change
+// what the number means (which pot is being spent, and when it resets).
+func (s *state) planBarLines(ctx sdk.Context, width int) []string {
+	if !strings.HasPrefix(ctx.Model(), providerID+"/") {
+		return nil
+	}
+	snap := enginePlan(s.engineRef())
+	if snap == nil {
+		return nil
+	}
+	s.mu.Lock()
+	phase, pct := s.planPhase, s.planPct
+	s.mu.Unlock()
+	if pct <= 0 {
+		pct = snapPercent(snap)
+	}
+	cells := provider.BarCells(width)
+	if phase < 0 {
+		phase = cells
+	}
+	bar := provider.PlanBar(pct, cells, phase)
+
+	rest := " " + trimFloat(pct) + "%"
+	switch {
+	case snap.Exhausted() && snap.BonusSpend > 0:
+		rest += " · included used · $" + money(float64(snap.BonusSpend)/100) + " bonus"
+	case snap.Exhausted():
+		rest += " · included used"
+	default:
+		rest += " · $" + money(float64(snap.Remaining())/100) + " left"
+	}
+	if !snap.CycleEnd.IsZero() {
+		rest += " · resets " + snap.CycleEnd.Local().Format("2 Jan")
+	}
+	line := " cursor " + bar + rest
+	if r := []rune(line); width > 0 && len(r) > width {
+		line = string(r[:max(0, width-1)]) + "…"
+	}
+	return []string{line}
+}
+
+// animatePlanBar fills the bar in over ~0.8s after a fresh read. The burst stops
+// by itself and a superseding refresh wins, so it never redraws indefinitely.
+func (s *state) animatePlanBar(ctx sdk.Context, snap *planusage.Snapshot) {
+	if os.Getenv("PI_CURSOR_PLAN_BAR") == "0" || snap == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.planShown {
+		s.mu.Unlock()
+		s.installPlanBar(ctx)
+		s.mu.Lock()
+	}
+	s.planAnim++
+	gen := s.planAnim
+	s.mu.Unlock()
+
+	cells := provider.BarCells(ctx.Width())
+	go func() {
+		for phase := 1; phase <= cells; phase++ {
+			time.Sleep(65 * time.Millisecond)
+			s.mu.Lock()
+			stale := s.planAnim != gen
+			s.planPhase = phase
+			s.mu.Unlock()
+			if stale {
+				return
+			}
+			_ = ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"})
+		}
+		s.mu.Lock()
+		if s.planAnim == gen {
+			s.planPhase = -1 // settled: show the true fill
+		}
+		s.mu.Unlock()
+		_ = ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"})
+	}()
 }

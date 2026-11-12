@@ -10,11 +10,11 @@ export CURSOR_API_KEY="$KEY"
 echo "== 1. Cursor Desktop installed and logged in =="
 python3 dev/tty-check.py cursor/grok-4.7 "Reply with exactly: plan-check" >/dev/null 2>&1
 cp docs/research/tty-session.txt /tmp/plan-present.txt
-grep -nE "plan:|cycle:|plan [0-9]|account:|not read" /tmp/plan-present.txt | sed 's/^/   /' | head -8
+grep -nE "▰|▱|plan:|cycle:|resets |account:|not read" /tmp/plan-present.txt | sed 's/^/   /' | head -10
 cp /tmp/plan-present.txt docs/evidence/tty-plan-usage.txt
 
 echo
 echo "== 2. same build, Cursor Desktop not findable =="
 PI_CURSOR_STORE_PATH=/nonexistent/state.vscdb python3 dev/tty-check.py cursor/grok-4.7 "Reply with exactly: plan-check" >/dev/null 2>&1
-grep -nE "plan:|not read" docs/research/tty-session.txt | sed 's/^/   /' | head -4
+grep -nE "▰|▱|plan:|not read" docs/research/tty-session.txt | sed 's/^/   /' | head -5
 cp docs/research/tty-session.txt /tmp/plan-absent.txt

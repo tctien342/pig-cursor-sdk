@@ -123,8 +123,17 @@ extension reads the plan through that login and the footer gains a real
 allowance line:
 
 ```text
-cursor · grok-4.7 · plan 7% · included used · $55.13 bonus · 24.1k tok
+ cursor ▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 7.1% · included used · $55.13 bonus · resets 30 Nov
 ```
+
+That row is a widget above the editor, so the built-in footer (model, tokens,
+branch) is untouched. It fills in over ~0.8 s when a fresh reading lands and then
+settles on the honest value; it never redraws on its own after that. The bar width
+follows the terminal (6 cells at 40 columns, 20 at 110+), the row is truncated
+rather than wrapped, and it appears only for `cursor/*` models — switching away
+removes it. `PI_CURSOR_PLAN_BAR=0` keeps the plain status-line form instead
+(`plan 7% · included used · $55.13 bonus`), and while the bar is on screen the
+status line drops the duplicate text.
 
 `/cursor-usage` prints the whole picture:
 
@@ -217,6 +226,7 @@ internal/provider          model catalog, pig transcript parsing, turn engine, d
 internal/planusage         plan allowance through Cursor Desktop's login: read-only, opt-out
 proto/, gen/               sdk.v1 protos (vendored) and their generated Go
 docs/display-rules.md      the display contract, enforced by tests
+internal/provider/bar.go   the plan bar: fill, animation cap, width fitting
 docs/evidence/             audit, live event capture, terminal capture, bridge resume log
 dev/                       live/multi-turn/PTY/plan runners, probes, benchmark — its own Go module
 scripts/gen-fallback-catalog.py  refresh the embedded offline catalog snapshot
