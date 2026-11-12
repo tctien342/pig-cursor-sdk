@@ -46,7 +46,8 @@ type state struct {
 	planPhase  int  // cells the bar may reveal; -1 once settled
 	planShown  bool // widget currently installed for this model
 	planPct    float64
-	planAnim   uint64 // stale-animation guard
+	planAnim   uint64    // stale-animation guard
+	planWarn   sync.Once // "no data" is worth saying once per session
 }
 
 // Extension is pig's standard Go factory entry point.
@@ -768,18 +769,38 @@ func (s *state) syncPlanBar(ctx sdk.Context) {
 	if os.Getenv("PI_CURSOR_PLAN_BAR") == "0" {
 		return
 	}
-	wantCursor := strings.HasPrefix(ctx.Model(), providerID+"/")
+	model := ctx.Model()
+	// The host replicates the model with its state updates, so it can still read
+	// "" in the session_start handler. Install anyway and let the renderer decide:
+	// a model that turns out not to be ours gets the widget removed on the next
+	// sync, which turn_end guarantees.
+	mine := model == "" || strings.HasPrefix(model, providerID+"/")
 	s.mu.Lock()
-	shown := s.planShown
-	s.mu.Unlock()
-	if wantCursor && !shown {
-		s.installPlanBar(ctx)
-	} else if !wantCursor && shown {
-		_ = ctx.SetWidgetRenderer(planWidgetKey, nil)
-		s.mu.Lock()
-		s.planShown = false
-		s.mu.Unlock()
+	shown := s.barShown()
+	var havePlan bool
+	if eng := s.engineRef(); eng != nil {
+		snap, _, _ := eng.Plan()
+		havePlan = snap != nil
 	}
+	newLogger().Info("plan bar sync", "model", model, "mine", mine, "shown", shown,
+		"width", ctx.Width(), "planData", havePlan)
+	if !mine {
+		if shown {
+			_ = ctx.SetWidgetRenderer(planWidgetKey, nil)
+			s.mu.Lock()
+			s.planShown = false
+			s.mu.Unlock()
+		}
+		return
+	}
+	if !shown {
+		s.installPlanBar(ctx)
+		return
+	}
+	// Already installed: re-push so the row is laid out for the live width. The
+	// host does not re-measure lines it was given, and a row that is too wide for
+	// the terminal is fatal to the TUI, not merely ugly.
+	_ = ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"})
 }
 
 func (s *state) barShown() bool {
@@ -793,11 +814,13 @@ func (s *state) installPlanBar(ctx sdk.Context) {
 		s.planRender = func(width int) []string { return s.planBarLines(ctx, width) }
 	}
 	if err := ctx.SetWidgetRenderer(planWidgetKey, s.planRender, sdk.WidgetOptions{"placement": "aboveEditor"}); err != nil {
+		newLogger().Warn("plan bar rejected by the host", "err", err.Error())
 		return
 	}
 	s.mu.Lock()
 	s.planShown = true
 	s.mu.Unlock()
+	newLogger().Info("plan bar installed")
 }
 
 // planBarLines is one row: label, bar, percentage, and the two facts that change
@@ -808,6 +831,9 @@ func (s *state) planBarLines(ctx sdk.Context, width int) []string {
 	}
 	snap := enginePlan(s.engineRef())
 	if snap == nil {
+		s.planWarn.Do(func() {
+			newLogger().Warn("plan bar has no data to draw", "hint", "the plan read did not return a snapshot")
+		})
 		return nil
 	}
 	s.mu.Lock()
@@ -816,7 +842,16 @@ func (s *state) planBarLines(ctx sdk.Context, width int) []string {
 	if pct <= 0 {
 		pct = snapPercent(snap)
 	}
+	if width < 0 {
+		width = 0
+	}
 	cells := provider.BarCells(width)
+	if width == 0 {
+		// No size reported yet. The host does not re-measure a line it is given,
+		// and an over-wide row kills the TUI, so send a short row and let the next
+		// sync resize it.
+		cells = 8
+	}
 	if phase < 0 {
 		phase = cells
 	}
@@ -834,10 +869,14 @@ func (s *state) planBarLines(ctx sdk.Context, width int) []string {
 	if !snap.CycleEnd.IsZero() {
 		rest += " · resets " + snap.CycleEnd.Local().Format("2 Jan")
 	}
+	if width == 0 {
+		rest = " " + trimFloat(pct) + "%"
+	}
 	line := " cursor " + bar + rest
 	if r := []rune(line); width > 0 && len(r) > width {
 		line = string(r[:max(0, width-1)]) + "…"
 	}
+	newLogger().Debug("plan bar rendered", "width", width, "cells", cells, "cols", len([]rune(line)))
 	return []string{line}
 }
 
