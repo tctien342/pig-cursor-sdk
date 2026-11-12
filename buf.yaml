@@ -1,0 +1,9 @@
+version: v2
+modules:
+  - path: upstream/sdk-bridge/proto
+lint:
+  use:
+    - BASIC
+breaking:
+  use:
+    - FILE

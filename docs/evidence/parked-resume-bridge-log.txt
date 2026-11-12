@@ -1,0 +1,68 @@
+[     0ms] spawning bridge for ~/Sources/Lab/pi-cursor-sdk-go
+[   174ms] bridge ready url=http://127.0.0.1:51973 serverVersion=1.0.0 pid=20933
+[   179ms] ping {"message":"pong"}
+[   180ms] version bridge=1.0.0 protocol=sdk.v1 capabilities=agent.create,agent.resume,agent.send,run.observe,run.wait,run.cancel,agent.management,cursor.catalog,artifacts.chunked,agent.usage
+[  3905ms] auth ok key=pi-dev user=tien.tran@it-consultis.net
+[  6268ms] catalog: 48 models: default grok-4.7 grok-4.6 composer-2.5 claude-opus-5-5 claude-opus-5 claude-opus-4-8 gemini-4-carbon gemini-4-argon muse-wonder-1.0 gpt-5.6-sol gpt-5.5 claude-fable-5-2 claude-fable-5-1 claude-fable-5 grok-4.5 gemini-3.8-flash muse-spark-1.3 gpt-5.6-terra claude-sonnet-5-5 claude-sonnet-5 claude-sonnet-4-6 composer-2 gpt-5.3-codex claude-opus-4-7 gpt-5.4 claude-opus-4-6 claude-opus-4-5 gpt-5.2 gpt-5.6-luna gemini-3.1-pro gpt-5.4-mini gpt-5.4-nano claude-haiku-5-5 claude-haiku-4-5 claude-sonnet-4-5 gpt-5.1 gemini-3-flash gemini-3.5-flash claude-sonnet-4 gpt-5-mini gemini-2.5-flash kimi-k3 kimi-k2.7-code glm-5.2 glm-5p3 glm-5p3-flash deepseek-v41-flash-1017
+[  6268ms] using model composer-2
+[  6270ms] tool callback registered at http://127.0.0.1:51989
+[  6738ms] agent eed2fbca-93cb-4ca0-982f-81696a2f95e0
+[  8906ms] send sdk_message status {"type":"status","agent_id":"eed2fbca-93cb-4ca0-982f-81696a2f95e0","run_id":"run-295ad61d-6854-4c3d-87ed-141ec7701dc1","status":"RUNNING"}
+[ 10903ms] send delta thinking-delta {"type":"thinking-delta","text":"I"}
+[ 10903ms] send thinking "I"
+[ 10926ms] send delta thinking-delta {"type":"thinking-delta","text":" will call the spike"}
+[ 10926ms] send thinking "will call the spike"
+[ 10987ms] send delta thinking-delta {"type":"thinking-delta","text":"_host_tool with the "}
+[ 10987ms] send thinking "_host_tool with the"
+[ 10987ms] send delta thinking-delta {"type":"thinking-delta","text":"command"}
+[ 10987ms] send thinking "command"
+[ 11006ms] send delta thinking-delta {"type":"thinking-delta","text":" \"echo parked-spike\""}
+[ 11007ms] send thinking "\"echo parked-spike\""
+[ 11020ms] send delta thinking-delta {"type":"thinking-delta","text":" and report its output"}
+[ 11020ms] send thinking "and report its output"
+[ 11052ms] send delta thinking-delta {"type":"thinking-delta","text":" in one short sentence"}
+[ 11052ms] send thinking "in one short sentence"
+[ 11080ms] send delta thinking-delta {"type":"thinking-delta","text":"."}
+[ 11080ms] send thinking "."
+[ 11080ms] send step thinkingMessage {"type":"thinkingMessage","message":{"text":"I will call the spike_host_tool with the command \"echo parked-spike\" and report its output in one short sentence.","thinkingDurationMs":154}}
+[ 11080ms] send delta thinking-completed {"type":"thinking-completed","thinkingDurationMs":154}
+[ 11080ms] send thinking ""
+[ 11080ms] send delta text-delta {"type":"text-delta","text":"Checking"}
+[ 11080ms] send sdk_message assistant {"type":"assistant","agent_id":"eed2fbca-93cb-4ca0-982f-81696a2f95e0","run_id":"run-295ad61d-6854-4c3d-87ed-141ec7701dc1","message":{"role":"assistant","content":[{"type":"text","text":"Checking"}]}}
+[ 11080ms] send delta text-delta {"type":"text-delta","text":" the spike"}
+[ 11080ms] send sdk_message assistant {"type":"assistant","agent_id":"eed2fbca-93cb-4ca0-982f-81696a2f95e0","run_id":"run-295ad61d-6854-4c3d-87ed-141ec7701dc1","message":{"role":"assistant","content":[{"type":"text","text":" the spike"}]}…
+[ 11080ms] send delta text-delta {"type":"text-delta","text":"_host_tool schema,"}
+[ 11080ms] send sdk_message assistant {"type":"assistant","agent_id":"eed2fbca-93cb-4ca0-982f-81696a2f95e0","run_id":"run-295ad61d-6854-4c3d-87ed-141ec7701dc1","message":{"role":"assistant","content":[{"type":"text","text":"_host_tool sch…
+[ 11080ms] send delta text-delta {"type":"text-delta","text":" then invoking it once"}
+[ 11080ms] send sdk_message assistant {"type":"assistant","agent_id":"eed2fbca-93cb-4ca0-982f-81696a2f95e0","run_id":"run-295ad61d-6854-4c3d-87ed-141ec7701dc1","message":{"role":"assistant","content":[{"type":"text","text":" then invoking…
+[ 11080ms] send delta text-delta {"type":"text-delta","text":".\n\n\n"}
+[ 11080ms] send sdk_message assistant {"type":"assistant","agent_id":"eed2fbca-93cb-4ca0-982f-81696a2f95e0","run_id":"run-295ad61d-6854-4c3d-87ed-141ec7701dc1","message":{"role":"assistant","content":[{"type":"text","text":".\n\n\n"}]}}
+[ 11080ms] send step assistantMessage {"type":"assistantMessage","message":{"text":"Checking the spike_host_tool schema, then invoking it once.\n\n\n"}}
+[ 11080ms] send delta tool-requests-listed {"type":"tool-requests-listed","callCount":1}
+[ 12092ms] send delta thinking-delta {"type":"thinking-delta","text":"I"}
+[ 12092ms] send thinking "I"
+[ 12110ms] send delta thinking-delta {"type":"thinking-delta","text":" have the schema. I "}
+[ 12110ms] send thinking "have the schema. I"
+[ 12110ms] send delta thinking-delta {"type":"thinking-delta","text":"will"}
+[ 12111ms] send thinking "will"
+[ 12130ms] send delta thinking-delta {"type":"thinking-delta","text":" call the tool with "}
+[ 12130ms] send thinking "call the tool with"
+[ 12130ms] send delta thinking-delta {"type":"thinking-delta","text":"command"}
+[ 12130ms] send thinking "command"
+[ 12149ms] send delta thinking-delta {"type":"thinking-delta","text":" \"echo parked-spike\"."}
+[ 12149ms] send thinking "\"echo parked-spike\"."
+[ 12155ms] send step thinkingMessage {"type":"thinkingMessage","message":{"text":"I have the schema. I will call the tool with command \"echo parked-spike\".","thinkingDurationMs":61}}
+[ 12155ms] send delta thinking-completed {"type":"thinking-completed","thinkingDurationMs":61}
+[ 12155ms] send thinking ""
+[ 12329ms] CALLBACK arrived tool=spike_host_tool id=tool_1aa50bc7-c46b-47ab-b62f-9a28cb483b4 args={"command":"echo parked-spike"}  (PARKING: pig would run this tool now)
+[ 12329ms] PARKED: tool=spike_host_tool — closing the Send stream to end this provider turn
+[ 12329ms] Send stream closed at 0ms (run still alive, parked on the host tool)
+[ 17330ms] RESOLVING callback with the host tool result
+[ 17330ms] CALLBACK resolved after 5000ms tool=spike_host_tool result={"result":{"value":"[host tool output, 5000ms] parked-tool-output ok"}}
+[ 19331ms] RESUME via ObserveRun run=run-295ad61d-6854-4c3d-87ed-141ec7701dc1 (durable offsets only)
+[ 19336ms] observe RESULT RUN_LIFECYCLE_STATUS_FINISHED {"runId":"run-295ad61d-6854-4c3d-87ed-141ec7701dc1","agentId":"eed2fbca-93cb-4ca0-982f-81696a2f95e0","status":"RUN_LIFECYCLE_STATUS_FINISHED","result":"**spike_host_tool** returned: `[host tool output, 5000ms] parked-too…
+[ 19336ms] observe DONE
+[ 19336ms] callbacks seen: 1 [spike_host_tool]
+[ 19336ms] last durable offset: "2"
+SPIKE_DONE
+EXIT=0

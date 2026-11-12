@@ -1,0 +1,17 @@
+# Build and editor noise
+.DS_Store
+*.test
+/pi-cursor-sdk-go
+
+# Local Go workspace shim: pig injects its own SDK resolution at build time,
+# and the replace below points at a machine-local path.
+go.work
+go.work.sum
+
+# Local runtime state: pig task data, extension logs, downloaded bridge binaries.
+.pi/
+*.log
+dev/bin/
+
+# Captured terminal/host traces beyond the two kept in docs/evidence.
+docs/evidence/tty-raw.txt
