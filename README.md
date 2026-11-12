@@ -161,7 +161,7 @@ a parse or HTTP failure means no line, not a wrong one.
 | `PI_CURSOR_STORE_PATH` | use a different Cursor store (tests, non-standard install) |
 
 Cost: the two HTTP calls took 1.8 s end to end, off the request path — a turn is
-never waiting on them. `go run ./cmd/planprobe` prints the numbers and the timings
+never waiting on them. `cd dev && go run ./cmd/planprobe` prints the numbers and the timings
 without starting pig.
 
 ### Limits from the protocol itself
@@ -218,10 +218,18 @@ internal/planusage         plan allowance through Cursor Desktop's login: read-o
 proto/, gen/               sdk.v1 protos (vendored) and their generated Go
 docs/display-rules.md      the display contract, enforced by tests
 docs/evidence/             audit, live event capture, terminal capture, bridge resume log
-dev/                       live/multi-turn/PTY/plan runners, bridge probes, benchmark
-cmd/planprobe              print plan numbers and timings without starting pig
+dev/                       live/multi-turn/PTY/plan runners, probes, benchmark — its own Go module
 scripts/gen-fallback-catalog.py  refresh the embedded offline catalog snapshot
 ```
+
+## One rule about layout
+
+Nothing under the extension root may declare `package main`. pig refuses to load a
+directory that holds both a factory and a standalone main package
+(*"contains both factory and standalone main packages; select one exact root"*), so
+probes and one-off tools live in `dev/`, which is a separate module. The layout is
+asserted by `TestNoMainPackageInExtensionRoot`, because otherwise the only symptom
+is everyone else's extension failing to start.
 
 ## Verification
 
@@ -232,7 +240,7 @@ pig install . --validate-only --json
 python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty-session.txt
 ./dev/run-edge.sh                 # several tool calls in one turn; no orphan bridge after a killed host
 ./dev/plan-check.sh               # plan readout with Cursor present, and with it absent
-go run ./cmd/planprobe            # plan numbers + timings, without starting pig
+cd dev && cd dev && go run ./cmd/planprobe  # plan numbers + timings, without starting pig
 ```
 
 ## Known limitations
