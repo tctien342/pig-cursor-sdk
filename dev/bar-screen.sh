@@ -63,9 +63,12 @@ EOF
 python3 dev/clean_ansi.py < "$RAW" > "$CAP" 2>/dev/null || cp "$RAW" "$CAP"
 
 echo "capture bytes: $(wc -c < "$RAW" | tr -d ' ')"
-echo "=== bar glyphs on screen ==="
-grep -ac '▰\|▱' "$CAP" | sed 's/^/  lines containing a bar: /'
-grep -ao ' cursor ▰.\{0,70\}\| cursor ▱.\{0,70\}' "$CAP" | tail -3
+echo "=== is the bar on the rendered screen? (pyte replay, not a grep) ==="
+if [ -x dev/.venv/bin/python ]; then
+  dev/.venv/bin/python dev/screen-state.py '▰|▱' "$RAW"
+else
+  echo "  dev/.venv missing: python3 -m venv dev/.venv && dev/.venv/bin/pip install pyte"
+fi
 echo "=== extension's own account of it ==="
 grep -aE "plan bar" ~/.pig/agent/pig-cursor-sdk/agent.log | tail -4 | sed 's/time=[^ ]* //' | cut -c1-150
 echo "=== last screen frame ==="

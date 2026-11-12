@@ -15,3 +15,4 @@ dev/bin/
 
 # Captured terminal/host traces beyond the two kept in docs/evidence.
 docs/evidence/tty-raw.txt
+dev/.venv/

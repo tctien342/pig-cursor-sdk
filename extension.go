@@ -826,6 +826,12 @@ func (s *state) installPlanBar(ctx sdk.Context) {
 // planBarLines is one row: label, bar, percentage, and the two facts that change
 // what the number means (which pot is being spent, and when it resets).
 func (s *state) planBarLines(ctx sdk.Context, width int) []string {
+	// PI_CURSOR_WIDGET_PROBE=1 draws a constant row instead of any plan data. It
+	// answers one question in isolation — does this host paint a widget pushed by a
+	// Go subprocess at all — so a missing bar is not confused with missing plan data.
+	if os.Getenv("PI_CURSOR_WIDGET_PROBE") == "1" {
+		return []string{" PI-WIDGET-PROBE-OK"}
+	}
 	if !strings.HasPrefix(ctx.Model(), providerID+"/") {
 		return nil
 	}
