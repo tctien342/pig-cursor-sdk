@@ -78,7 +78,7 @@ maps onto the model's own reasoning parameter.
 | --- | --- |
 | `/cursor-refresh-models` | re-read the catalog through the bridge, cache it, re-register |
 | `/cursor-mode plan\|agent` | Cursor plan mode vs agent mode |
-| `/cursor-abort` | release this session's live Cursor run (completed host work is not undone) |
+| `/cursor-abort` | release the Cursor run live in *this* pig process (completed host work is not undone) |
 | `/cursor-status` | bridge pid, catalog size, mode, key presence, tool mode |
 | `/cursor-login` | store an API key |
 
@@ -147,6 +147,9 @@ python3 dev/tty-check.py          # interactive PTY capture -> docs/evidence/tty
 
 - Model aliases the TypeScript extension invented (`auto`, `composer`,
   `fable-5-2@1m`) are not part of `sdk.v1`; only canonical Cursor ids are offered.
+- `/cursor-abort` releases the run this pig process is holding. A run left active
+  by a process that died is not cancelled eagerly: the next send notices the agent
+  still owns an upstream run, releases it, and starts a clean one (logged at INFO).
 - If Cursor answers with one of *its own* built-in tools instead of a host tool,
   no card renders — there is no host tool to attach one to. The footer says
   `Cursor ran Shell (its own tool)` instead; a transcript line for it would be

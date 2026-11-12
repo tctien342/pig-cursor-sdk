@@ -2,6 +2,7 @@ package cursor
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	sdkpb "github.com/tctien342/pig-cursor-sdk/gen/sdk/v1"
@@ -52,49 +53,75 @@ type Event struct {
 // declared tool name; for host-owned custom tools the bridge reports the
 // envelope name ("mcp") and the real name sits in Args, which Decode unwraps.
 type ToolCallEvent struct {
-	// ID is the call id in host-safe form: see DisplayCallID.
-	ID       string
-	RunID    string
-	AgentID  string
-	ToolName string
-	Args     map[string]any
-	Status   string // running | completed | error
-	Result   map[string]any
-	IsError  bool
-	Text     string // the tool result rendered as text, when available
+	// ID is Cursor's id, verbatim, and the internal key.
+	ID string
+	// DisplayID is the host-safe form of ID: see DisplayCallID.
+	DisplayID string
+	RunID     string
+	AgentID   string
+	ToolName  string
+	Args      map[string]any
+	Status    string // running | completed | error
+	Result    map[string]any
+	IsError   bool
+	Text      string // the tool result rendered as text, when available
 }
 
-// DisplayCallID normalises a Cursor tool-call id for use as an identifier.
-// Cursor publishes ids that contain a literal newline, e.g.
+// DisplayCallID rewrites a Cursor tool-call id into a form that is safe to use
+// where an id is expected to be one token.
+//
+// Cursor publishes ids containing a literal newline, e.g.
 //
 //	call-dc6de823-...-1\nfc_00b4b5ed-..._0
 //
-// which is fine inside a JSON string but ugly everywhere an id is expected to be
-// one token: it lands verbatim in the host's session transcript and it breaks
-// one-line-per-event log parsing. Whitespace runs collapse to a single "_", which
-// is injective for ids that differ only in whitespace, and the id is never sent
-// back to the bridge (results are delivered by unblocking the parked callback),
-// so no correlation is lost.
+// Legal in a JSON string, but it lands verbatim in the host's session transcript
+// and it splits one-line-per-event log parsing. Whitespace is percent-encoded
+// rather than collapsed: collapsing maps `a\nb` and `a_b` onto each other, and
+// this value keys things, so the rewrite must stay reversible.
+//
+// The raw id stays the internal key everywhere (parked ledger, replay dedup);
+// this form is only what the host and the log see. DecodeCallID inverts it.
 func DisplayCallID(id string) string {
 	if !strings.ContainsAny(id, " \t\n\r") {
 		return id
 	}
 	var b strings.Builder
-	b.Grow(len(id))
-	pending := false
-	for _, r := range id {
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-			pending = true
-			continue
+	b.Grow(len(id) + 4)
+	for i := 0; i < len(id); i++ {
+		switch id[i] {
+		case ' ':
+			b.WriteString("%20")
+		case '\t':
+			b.WriteString("%09")
+		case '\n':
+			b.WriteString("%0A")
+		case '\r':
+			b.WriteString("%0D")
+		default:
+			b.WriteByte(id[i])
 		}
-		if pending {
-			b.WriteByte('_')
-			pending = false
-		}
-		b.WriteRune(r)
 	}
-	if pending {
-		b.WriteByte('_')
+	return b.String()
+}
+
+// DecodeCallID inverts DisplayCallID. Callers that need the id Cursor itself
+// knows should start from the raw value instead; this exists so a display id can
+// be traced back when reading logs.
+func DecodeCallID(id string) string {
+	if !strings.Contains(id, "%") {
+		return id
+	}
+	var b strings.Builder
+	b.Grow(len(id))
+	for i := 0; i < len(id); i++ {
+		if id[i] == '%' && i+2 < len(id) {
+			if v, err := strconv.ParseUint(id[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(id[i])
 	}
 	return b.String()
 }
@@ -252,12 +279,13 @@ func decodeToolCall(payload map[string]any, offset string) Event {
 		kind = EventToolCallCompleted
 	}
 	tc := &ToolCallEvent{
-		ID:       DisplayCallID(str(payload["call_id"])),
-		RunID:    str(payload["run_id"]),
-		AgentID:  str(payload["agent_id"]),
-		ToolName: str(payload["name"]),
-		Args:     mapOrNil(payload["args"]),
-		Status:   status,
+		ID:        str(payload["call_id"]),
+		DisplayID: DisplayCallID(str(payload["call_id"])),
+		RunID:     str(payload["run_id"]),
+		AgentID:   str(payload["agent_id"]),
+		ToolName:  str(payload["name"]),
+		Args:      mapOrNil(payload["args"]),
+		Status:    status,
 	}
 	unwrapCustomTool(tc)
 	if res := mapOrNil(payload["result"]); res != nil {
@@ -319,7 +347,7 @@ func deltaOrSkip(kind EventKind, offset string, payload map[string]any, key stri
 
 func interactionToolCall(payload map[string]any, offset string, kind EventKind) Event {
 	call := mapOrNil(payload["toolCall"])
-	tc := &ToolCallEvent{ID: DisplayCallID(str(payload["callId"])), Status: "running"}
+	tc := &ToolCallEvent{ID: str(payload["callId"]), DisplayID: DisplayCallID(str(payload["callId"])), Status: "running"}
 	if kind == EventToolCallCompleted {
 		tc.Status = "completed"
 	}

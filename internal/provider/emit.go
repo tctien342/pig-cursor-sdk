@@ -125,7 +125,10 @@ func (t *turnEmitter) hostToolCall(ev cursor.RunEvent) bool {
 	if ev.ToolCall == nil {
 		return false
 	}
-	id, name, args := ev.ToolCall.ID, ev.ToolCall.ToolName, ev.ToolCall.Args
+	id, name, args := ev.ToolCall.DisplayID, ev.ToolCall.ToolName, ev.ToolCall.Args
+	if id == "" {
+		id = ev.ToolCall.ID
+	}
 	t.closeThinking()
 	t.closeText()
 	tc := t.p.openToolCall(id, name, args)

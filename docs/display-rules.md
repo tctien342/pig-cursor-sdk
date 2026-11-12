@@ -73,16 +73,33 @@ slice reports one park and one delivery per call id.
 Cursor publishes tool-call ids that contain a literal newline:
 
 ```text
-call-dc6de823-12c8-4268-b573-5c28e0ae464f-1\nfc_00b4b5ed-b09c-964d-be33-bfa7a9c6826e_0
+call-dc6de823-12c8-4268-b573-5c28e0ae464f-1\nfc_00b4b5ed-..._0
 ```
 
 Passing that through puts a newline into the host's session transcript and breaks
-one-line-per-event log parsing, so the decoder collapses whitespace runs to `_`
-(`cursor.DisplayCallID`) at both points an id enters: the tool-call frame and the
-tool callback. Same function on both paths, so the parked-ledger key, the card id
-the host sees, and the log line always agree; applying it twice changes nothing.
-Nothing sends the id back to Cursor — results are delivered by unblocking the
-parked callback — so the rewrite loses no correlation.
+one-line-per-event log parsing. So an id has two forms: Cursor's raw id stays the
+internal key (parked ledger, replay dedup), and `cursor.DisplayCallID` produces the
+form the host and the log see, which percent-encodes whitespace
+(`…-1%0Afc_…_0`). It is not a lossy collapse — `a\nb`, `a b` and `a_b` must stay
+distinguishable, because the value keys calls — so it is reversible
+(`cursor.DecodeCallID`), idempotent, and applied at both points an id enters: the
+tool-call frame and the tool callback. Same function on both paths means the
+ledger key, the card id the host holds, and the log line always agree.
+
+`TestDisplayCallIDSplitsWhitespaceWithoutLosingIt` pins reversibility,
+idempotence, and the collision cases;
+`TestParkedCallCarriesHostSafeID` pins that the ledger keeps the raw id while the
+host gets the encoded one.
+
+## A late tail of a batch is still a call
+
+The batch window is a window, not a guarantee: the run can park on the first call,
+and Cursor can send the rest of the turn afterwards. `park` then registers the late
+call against the same run, so the next provider call hands it over and resolves it
+like any other. `TestLateCallbackAfterFirstParkStillResolves` drives exactly that:
+park, pause the stream, park again, then assert both calls are pending in arrival
+order, each accepts exactly one result (the second resolve of the same id is
+refused), both callbacks return, and nothing is left pending.
 
 `dev/run-edge.sh` also checks that a `SIGTERM`'d host leaves no orphaned bridge:
 bridges before = 0, after = 0.

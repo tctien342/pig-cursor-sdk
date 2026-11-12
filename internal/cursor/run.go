@@ -285,7 +285,10 @@ type Image struct {
 
 // ParkedCall is one host tool execution the Cursor run is waiting on.
 type ParkedCall struct {
-	ID        string
+	// ID is Cursor's id, verbatim: the key of the parked ledger.
+	ID string
+	// DisplayID is the host-safe form handed to the provider host and the log.
+	DisplayID string
 	ToolName  string
 	Args      map[string]any
 	ArrivedAt time.Time
@@ -306,6 +309,14 @@ func (p *ParkedCall) Settled() (map[string]any, error, bool) {
 
 // ID and name accessors for callers that only have the handle.
 func (p *ParkedCall) Name() string { return p.ToolName }
+
+// HostID is the id the host knows this call by.
+func (p *ParkedCall) HostID() string {
+	if p.DisplayID != "" {
+		return p.DisplayID
+	}
+	return p.ID
+}
 
 // RunEvent is one item a provider turn consumes.
 type RunEvent struct {
@@ -593,7 +604,7 @@ func (r *Run) ResolveHostCall(id string, payload map[string]any, isError bool, n
 	r.order = rest
 	r.mu.Unlock()
 	if r.agent != nil && r.agent.client != nil && r.agent.client.log != nil {
-		r.agent.client.log.Info("host tool result delivered", "tool", p.ToolName, "id", id, "bytes", len(note))
+		r.agent.client.log.Info("host tool result delivered", "tool", p.ToolName, "id", p.HostID(), "bytes", len(note))
 	}
 	return true
 }
@@ -656,9 +667,10 @@ func (r *Run) Usage() *Usage {
 
 // park holds a host tool call until the host resolves it.
 func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, error) {
-	id := DisplayCallID(orString(req.ToolCallID, fmt.Sprintf("tool_%d", time.Now().UnixNano())))
+	raw := orString(req.ToolCallID, fmt.Sprintf("tool_%d", time.Now().UnixNano()))
+	id := DisplayCallID(raw)
 	p := &ParkedCall{
-		ID: id, ToolName: req.ToolName, Args: req.Args,
+		ID: raw, DisplayID: id, ToolName: req.ToolName, Args: req.Args,
 		ArrivedAt: req.ArrivedAt, done: make(chan struct{}),
 	}
 	if p.ArrivedAt.IsZero() {
@@ -670,7 +682,7 @@ func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, er
 		r.mu.Unlock()
 		return nil, errors.New("cursor: run already ended")
 	}
-	if existing, ok := r.parked[id]; ok {
+	if existing, ok := r.parked[raw]; ok {
 		// A duplicate callback for the same call id must not run the tool twice.
 		r.mu.Unlock()
 		if res, err2, done := existing.Settled(); done {
@@ -678,10 +690,10 @@ func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, er
 		}
 		return nil, errors.New("cursor: duplicate tool callback is already pending")
 	}
-	r.parked[id] = p
+	r.parked[raw] = p
 	paused := r.paused
 	r.paused = true
-	r.order = append(r.order, id)
+	r.order = append(r.order, raw)
 	cancel := r.cancelStream
 	r.mu.Unlock()
 
@@ -692,7 +704,7 @@ func (r *Run) park(ctx context.Context, req ToolCallRequest) (map[string]any, er
 	r.queue.push(RunEvent{
 		Event: Event{
 			Kind:     EventToolCallStarted,
-			ToolCall: &ToolCallEvent{ID: id, ToolName: req.ToolName, Args: req.Args, Status: "running"},
+			ToolCall: &ToolCallEvent{ID: raw, DisplayID: id, ToolName: req.ToolName, Args: req.Args, Status: "running"},
 		},
 		Pending: p,
 	})

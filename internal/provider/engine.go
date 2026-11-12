@@ -322,16 +322,17 @@ func (e *Engine) resumeParked(ctx sdk.Context, sess *Session, client *cursor.Cli
 		}
 		return nil
 	}
+	// pig knows these calls by the host-safe id we handed it, not by Cursor's.
 	ids := make([]string, 0, len(parked))
 	for _, p := range parked {
-		ids = append(ids, p.ID)
+		ids = append(ids, p.HostID())
 	}
 	got := piCtx.PendingToolResults(ids)
 	if len(got) == 0 {
 		return nil
 	}
 	for _, p := range parked {
-		out, ok := got[p.ID]
+		out, ok := got[p.HostID()]
 		if !ok {
 			// A batch may still be in flight; resolve what we have and keep
 			// waiting for the rest on the next turn.
@@ -339,7 +340,7 @@ func (e *Engine) resumeParked(ctx sdk.Context, sess *Session, client *cursor.Cli
 		}
 		run.ResolveHostCall(p.ID, map[string]any{"content": out.Text}, out.IsError, out.Text)
 		if debug {
-			e.cfg.Logger.Debug("resolved parked host call", "id", p.ID, "tool", p.ToolName, "bytes", len(out.Text))
+			e.cfg.Logger.Debug("resolved parked host call", "id", p.HostID(), "tool", p.ToolName, "bytes", len(out.Text))
 		}
 	}
 	// Drop the calls we resolved from the session ledger.

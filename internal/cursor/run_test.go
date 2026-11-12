@@ -24,6 +24,99 @@ func req(id, tool string) ToolCallRequest {
 	}
 }
 
+// A batch can arrive after the provider turn already parked on the first call:
+// the grace window may expire, the stream gets paused, and Cursor sends the rest
+// of the turn afterwards. Both calls must still reach the host, each be answered
+// exactly once, and nothing may hang.
+func TestLateCallbackAfterFirstParkStillResolves(t *testing.T) {
+	r := newTestRun()
+	defer r.c()
+
+	type outcome struct {
+		m   map[string]any
+		err error
+	}
+	got := make(chan outcome, 2)
+	park := func(id string) {
+		go func() {
+			m, err := r.park(context.Background(), req(id, "bash"))
+			got <- outcome{m, err}
+		}()
+	}
+
+	park("call_1")
+	ev, ok := r.Next(context.Background())
+	if !ok || ev.Pending == nil {
+		t.Fatalf("first event = %+v ok=%v, want a pending host call", ev, ok)
+	}
+	r.PauseStream() // the turn handed call_1 back and ended
+
+	park("call_2") // the late tail of the same batch
+	deadline := time.Now().Add(2 * time.Second)
+	for len(r.PendingHostCalls()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	pending := r.PendingHostCalls()
+	if len(pending) != 2 {
+		t.Fatalf("pending = %d, want both calls of the batch", len(pending))
+	}
+	if pending[0].ID != "call_1" || pending[1].ID != "call_2" {
+		t.Fatalf("pending order = %s, %s, want arrival order", pending[0].ID, pending[1].ID)
+	}
+
+	for _, p := range pending {
+		if !r.ResolveHostCall(p.ID, map[string]any{"content": "out " + p.ID}, false, "out "+p.ID) {
+			t.Fatalf("resolve %s was refused", p.ID)
+		}
+		if r.ResolveHostCall(p.ID, map[string]any{"content": "again"}, false, "again") {
+			t.Fatalf("a second resolve of %s was accepted", p.ID)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case o := <-got:
+			if o.err != nil {
+				t.Fatalf("parked callback returned an error: %v", o.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("a parked callback never returned; the run hung")
+		}
+	}
+	if left := r.PendingHostCalls(); len(left) != 0 {
+		t.Fatalf("%d host call(s) still pending after all results were delivered", len(left))
+	}
+}
+
+// The host must see a one-token id while the ledger keeps Cursor's own.
+func TestParkedCallCarriesHostSafeID(t *testing.T) {
+	r := newTestRun()
+	defer r.c()
+
+	raw := "call-9\nfc_9_0"
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = r.park(context.Background(), req(raw, "bash"))
+	}()
+	ev, ok := r.Next(context.Background())
+	if !ok || ev.Pending == nil {
+		t.Fatalf("first event = %+v ok=%v, want a pending host call", ev, ok)
+	}
+	if ev.Pending.ID != raw {
+		t.Fatalf("ledger id = %q, want Cursor's raw id %q", ev.Pending.ID, raw)
+	}
+	if ev.Pending.HostID() != "call-9%0Afc_9_0" {
+		t.Fatalf("host id = %q, want call-9%%0Afc_9_0", ev.Pending.HostID())
+	}
+	if ev.ToolCall.ID != raw || ev.ToolCall.DisplayID != ev.Pending.HostID() {
+		t.Fatalf("event ids = %q / %q, want raw and host-safe forms", ev.ToolCall.ID, ev.ToolCall.DisplayID)
+	}
+	if !r.ResolveHostCall(raw, map[string]any{"content": "ok"}, false, "ok") {
+		t.Fatal("resolve by the raw id was refused")
+	}
+	<-done
+}
+
 // TestParkedCallSurvivesProviderBoundary is the property the whole design
 // rests on: the bridge's callback stays open until the host resolves it, and
 // the run keeps streaming in the meantime.
